@@ -18,6 +18,41 @@ class TestBuildPrompt:
         assert result.endswith(PROMPT_SUFFIX)
         assert "do X" in result
 
+    def test_first_attempt_unchanged(self):
+        """retries == 0 时行为与传入字符串一致."""
+        task = Task(path=Path("/tmp/fake.md"), name="test", content="do X", retries=0)
+        result = build_prompt(task)
+        assert result == PROMPT_PREFIX + "do X" + PROMPT_SUFFIX
+
+    def test_retry_prompt_includes_error(self):
+        """retries > 0 时 prompt 包含错误信息."""
+        content = (
+            "<!-- FAILED at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: timeout after 600s -->\n"
+            "<!-- RETRY: 1 -->\n"
+            "do something\n"
+        )
+        task = Task(path=Path("/tmp/fake.md"), name="test", content=content, retries=1)
+        result = build_prompt(task)
+        assert "timeout after 600s" in result
+        assert "第 2 次尝试" in result
+        assert "避免同样的错误" in result
+
+    def test_retry_prompt_clean_body(self):
+        """重试 prompt 不包含 HTML 注释."""
+        content = (
+            "<!-- FAILED at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: broke -->\n"
+            "<!-- RETRY: 1 -->\n"
+            "do something\n"
+        )
+        task = Task(path=Path("/tmp/fake.md"), name="test", content=content, retries=1)
+        result = build_prompt(task)
+        assert "<!-- FAILED" not in result
+        assert "<!-- Error:" not in result
+        assert "<!-- RETRY:" not in result
+        assert "do something" in result
+
 
 class TestWorkerLoop:
     def test_empty_queue(self, config: Config, queue: TaskQueue):

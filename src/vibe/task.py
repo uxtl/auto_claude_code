@@ -14,6 +14,14 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 _RETRY_PATTERN = re.compile(r"<!--\s*RETRY:\s*(\d+)\s*-->")
+_ERROR_PATTERN = re.compile(r"<!--\s*Error:\s*(.*?)\s*-->")
+_COMMENT_PREFIXES = (
+    "<!-- RETRY:",
+    "<!-- FAILED",
+    "<!-- FINAL FAILURE",
+    "<!-- Error:",
+    "<!-- Retries exhausted",
+)
 
 
 @dataclass
@@ -154,13 +162,6 @@ class TaskQueue:
             return []
 
         _ts_prefix = re.compile(r"^\d{8}_\d{6}(_\d{6})?_")
-        _comment_prefixes = (
-            "<!-- RETRY:",
-            "<!-- FAILED",
-            "<!-- FINAL FAILURE",
-            "<!-- Error:",
-            "<!-- Retries exhausted",
-        )
 
         # 查找匹配的失败任务
         if name is not None:
@@ -174,11 +175,7 @@ class TaskQueue:
         retried: list[str] = []
         for src in matches:
             content = src.read_text(encoding="utf-8")
-            clean_lines = [
-                line for line in content.splitlines()
-                if not any(line.strip().startswith(p) for p in _comment_prefixes)
-            ]
-            clean_content = "\n".join(clean_lines).strip() + "\n"
+            _, clean_content = extract_error_context(content)
 
             dest_name = _ts_prefix.sub("", src.name)
             dest = task_dir / dest_name
@@ -240,6 +237,26 @@ def _extract_retry_count(content: str) -> int:
     """从任务内容中提取重试次数."""
     match = _RETRY_PATTERN.search(content)
     return int(match.group(1)) if match else 0
+
+
+def extract_error_context(content: str) -> tuple[list[str], str]:
+    """从任务内容中提取错误上下文，返回 (错误信息列表, 清理后的内容)。
+
+    解析 <!-- FAILED at ... -->, <!-- Error: ... --> 等注释行，
+    提取错误文本，并返回去除这些注释后的干净内容。
+    """
+    errors: list[str] = []
+    clean_lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if any(stripped.startswith(p) for p in _COMMENT_PREFIXES):
+            m = _ERROR_PATTERN.search(stripped)
+            if m:
+                errors.append(m.group(1))
+        else:
+            clean_lines.append(line)
+    clean_content = "\n".join(clean_lines).strip() + "\n" if clean_lines else ""
+    return errors, clean_content
 
 
 def _set_retry_count(content: str, count: int) -> str:

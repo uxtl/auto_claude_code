@@ -10,7 +10,7 @@ from . import manager
 from .approval import ApprovalStore
 from .config import Config
 from .manager import TaskResult
-from .task import Task, TaskQueue
+from .task import Task, TaskQueue, extract_error_context
 
 PROMPT_PREFIX = "先阅读 PROGRESS.md 了解项目历史和经验，然后执行以下任务：\n\n"
 PROMPT_SUFFIX = "\n\n完成后，将本次经验教训更新到 PROGRESS.md。"
@@ -19,9 +19,28 @@ PROMPT_SUFFIX = "\n\n完成后，将本次经验教训更新到 PROGRESS.md。"
 shutdown_event = threading.Event()
 
 
-def build_prompt(task_content: str) -> str:
-    """构建完整的 prompt：注入读取 PROGRESS.md 和更新 PROGRESS.md 的指令."""
-    return PROMPT_PREFIX + task_content + PROMPT_SUFFIX
+def build_prompt(task: Task | str) -> str:
+    """构建完整的 prompt：注入读取 PROGRESS.md 和更新 PROGRESS.md 的指令.
+
+    重试时注入错误上下文，帮助 Claude Code 避免重复同样的错误。
+    接受 Task 对象或纯字符串（向后兼容）。
+    """
+    if isinstance(task, str):
+        return PROMPT_PREFIX + task + PROMPT_SUFFIX
+
+    if task.retries > 0:
+        errors, clean_content = extract_error_context(task.content)
+        if errors:
+            error_block = "\n".join(f"- {e}" for e in errors)
+            return (
+                PROMPT_PREFIX
+                + clean_content
+                + f"\n\n## 上次执行失败信息\n\n"
+                f"这是第 {task.retries + 1} 次尝试。之前失败的原因：\n{error_block}\n"
+                f"请特别注意避免同样的错误。\n"
+                + PROMPT_SUFFIX
+            )
+    return PROMPT_PREFIX + task.content + PROMPT_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +94,7 @@ def _execute_task(
     approval_store: ApprovalStore | None = None,
 ) -> None:
     """执行单个任务并处理结果."""
-    prompt = build_prompt(task.content)
+    prompt = build_prompt(task)
     docker_kw = _docker_kwargs(config)
 
     if (

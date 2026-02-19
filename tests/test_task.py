@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vibe.config import Config
-from vibe.task import TaskQueue, _extract_retry_count, _set_retry_count, _MAX_TASK_FILE_SIZE
+from vibe.task import TaskQueue, _extract_retry_count, _set_retry_count, _MAX_TASK_FILE_SIZE, extract_error_context
 
 
 # ── retry count 辅助函数 ─────────────────────────────────────
@@ -26,6 +26,55 @@ class TestRetryCount:
         result = _set_retry_count(original, 2)
         assert "<!-- RETRY: 2 -->" in result
         assert "<!-- RETRY: 1 -->" not in result
+
+
+# ── extract_error_context ────────────────────────────────────
+
+class TestExtractErrorContext:
+    def test_no_errors(self):
+        errors, clean = extract_error_context("do something\n")
+        assert errors == []
+        assert "do something" in clean
+
+    def test_with_errors(self):
+        content = (
+            "<!-- FAILED at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: timeout -->\n"
+            "<!-- RETRY: 1 -->\n"
+            "do something\n"
+        )
+        errors, clean = extract_error_context(content)
+        assert errors == ["timeout"]
+        assert "do something" in clean
+
+    def test_multiple_errors(self):
+        content = (
+            "<!-- FAILED at 2024-01-02T12:00:00 -->\n"
+            "<!-- Error: permission denied -->\n"
+            "<!-- FAILED at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: timeout -->\n"
+            "<!-- RETRY: 2 -->\n"
+            "do something\n"
+        )
+        errors, clean = extract_error_context(content)
+        assert len(errors) == 2
+        assert "permission denied" in errors
+        assert "timeout" in errors
+
+    def test_clean_content(self):
+        content = (
+            "<!-- FINAL FAILURE at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: some error -->\n"
+            "<!-- Retries exhausted: 2/2 -->\n"
+            "<!-- RETRY: 2 -->\n"
+            "do something\n"
+        )
+        errors, clean = extract_error_context(content)
+        assert "FAILED" not in clean
+        assert "Error:" not in clean
+        assert "RETRY" not in clean
+        assert "Retries exhausted" not in clean
+        assert "do something" in clean
 
 
 # ── TaskQueue ────────────────────────────────────────────────
