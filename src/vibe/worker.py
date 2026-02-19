@@ -12,8 +12,23 @@ from .config import Config
 from .manager import TaskResult
 from .task import Task, TaskQueue, extract_error_context
 
-PROMPT_PREFIX = "先阅读 PROGRESS.md 了解项目历史和经验，然后执行以下任务：\n\n"
-PROMPT_SUFFIX = "\n\n完成后，将本次经验教训更新到 PROGRESS.md。"
+PROMPT_PREFIX = (
+    "## 执行前准备\n"
+    "1. 阅读 CLAUDE.md 了解项目架构和开发约定\n"
+    "2. 阅读 PROGRESS.md 了解项目历史、已知问题和经验教训\n"
+    "3. 注意：可能有其他 agent 在并行工作，只修改与本任务相关的文件\n\n"
+    "## 任务内容\n\n"
+)
+
+PROMPT_SUFFIX = (
+    "\n\n## 完成后要求\n"
+    "1. 确保代码能运行，通过相关测试\n"
+    "2. git add 并 commit 变更（message 格式见 CLAUDE.md）\n"
+    "3. 更新 PROGRESS.md：\n"
+    "   - 在「已完成任务」顶部追加本次记录（含改动文件、测试结果）\n"
+    "   - 在「经验教训」中记录有价值的发现\n"
+    "   - 在「已知问题」中记录发现但未处理的问题\n"
+)
 
 # 模块级关闭事件，供信号处理器通知所有 worker 退出
 shutdown_event = threading.Event()

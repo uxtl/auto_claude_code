@@ -16,7 +16,7 @@ TEMPLATE_DIR="$SCRIPT_DIR/../templates"
 
 cp "$TEMPLATE_DIR/CLAUDE.md" "$TARGET/CLAUDE.md"
 cp "$TEMPLATE_DIR/PROGRESS.md" "$TARGET/PROGRESS.md"
-mkdir -p "$TARGET/tasks" "$TARGET/tasks/done"
+mkdir -p "$TARGET/tasks" "$TARGET/tasks/done" "$TARGET/tasks/failed"
 
 echo "脚手架已初始化到 $TARGET"
 echo "  - CLAUDE.md 已复制（请修改 {project_name}）"
