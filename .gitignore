@@ -1,7 +1,16 @@
 .venv
 .pytest_cache
 reference_data
-__pycache__
+
+# Environment
+.env
+
+# Python
+__pycache__/
 *.pyc
 *.pyo
-*.pyd
+.venv/
+venv/
+dist/
+*.egg-info/
+.pytest_cache
