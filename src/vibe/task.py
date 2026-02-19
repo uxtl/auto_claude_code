@@ -141,6 +141,55 @@ class TaskQueue:
             )
 
     @staticmethod
+    def retry_failed(task_dir: Path, fail_dir: Path, name: str | None = None) -> list[str]:
+        """将失败任务清理后移回待执行队列。
+
+        清除错误注释头（RETRY/FAILED/Error），去除时间戳文件名前缀。
+        name=None 时重试所有失败任务。
+
+        Returns:
+            重试的文件名列表
+        """
+        if not fail_dir.is_dir():
+            return []
+
+        _ts_prefix = re.compile(r"^\d{8}_\d{6}(_\d{6})?_")
+        _comment_prefixes = (
+            "<!-- RETRY:",
+            "<!-- FAILED",
+            "<!-- FINAL FAILURE",
+            "<!-- Error:",
+            "<!-- Retries exhausted",
+        )
+
+        # 查找匹配的失败任务
+        if name is not None:
+            matches = [
+                f for f in fail_dir.glob("*.md")
+                if f.stem == name or _ts_prefix.sub("", f.stem) == name
+            ]
+        else:
+            matches = sorted(fail_dir.glob("*.md"))
+
+        retried: list[str] = []
+        for src in matches:
+            content = src.read_text(encoding="utf-8")
+            clean_lines = [
+                line for line in content.splitlines()
+                if not any(line.strip().startswith(p) for p in _comment_prefixes)
+            ]
+            clean_content = "\n".join(clean_lines).strip() + "\n"
+
+            dest_name = _ts_prefix.sub("", src.name)
+            dest = task_dir / dest_name
+            dest.write_text(clean_content, encoding="utf-8")
+            src.unlink()
+            retried.append(dest_name)
+            logger.info("重试任务: %s → %s", src.name, dest_name)
+
+        return retried
+
+    @staticmethod
     def recover_running(task_dir: Path) -> int:
         """恢复所有 .running.* 文件为 .md（用于 crash 恢复）.
 

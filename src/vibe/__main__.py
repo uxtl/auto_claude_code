@@ -136,6 +136,25 @@ def cmd_add(args: argparse.Namespace) -> None:
     print(f"已添加任务: {filename}")
 
 
+def cmd_retry(args: argparse.Namespace) -> None:
+    """重试失败任务 — 清除错误注释，移回任务队列."""
+    config = load_config(Path(args.workspace) if args.workspace else None)
+    if args.workspace:
+        config.workspace = args.workspace
+    workspace = Path(config.workspace).resolve()
+    task_dir = workspace / config.task_dir
+    fail_dir = workspace / config.fail_dir
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    retried = TaskQueue.retry_failed(task_dir, fail_dir, name=args.name)
+    if retried:
+        for name in retried:
+            print(f"  已重试: {name}")
+        print(f"共重试 {len(retried)} 个任务")
+    else:
+        print("没有需要重试的失败任务")
+
+
 def cmd_recover(args: argparse.Namespace) -> None:
     """恢复 .running 文件."""
     config = load_config(Path(args.workspace) if args.workspace else None)
@@ -195,6 +214,12 @@ def main() -> None:
     p_recover = subparsers.add_parser("recover", help="恢复 .running 任务文件")
     p_recover.add_argument("--workspace", "-w", help="工作目录")
     p_recover.set_defaults(func=cmd_recover)
+
+    # retry
+    p_retry = subparsers.add_parser("retry", help="重试失败任务")
+    p_retry.add_argument("name", nargs="?", default=None, help="任务名（可选，为空则重试所有）")
+    p_retry.add_argument("--workspace", "-w", help="工作目录")
+    p_retry.set_defaults(func=cmd_retry)
 
     args = parser.parse_args()
 

@@ -152,35 +152,10 @@ def create_app(
         fail_dir = workspace / config.fail_dir
         task_dir = workspace / config.task_dir
 
-        # 在 failed/ 中查找匹配的任务（精确匹配，去除时间戳前缀后比较）
-        matches = [
-            f for f in fail_dir.glob("*.md")
-            if f.stem == name or re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem) == name
-        ]
-        if not matches:
+        retried = TaskQueue.retry_failed(task_dir, fail_dir, name=name)
+        if not retried:
             return JSONResponse({"error": f"未找到失败任务: {name}"}, status_code=404)
-
-        src = matches[0]
-        content = src.read_text(encoding="utf-8")
-        # 移除 RETRY / FAILED 注释头
-        clean_lines = [
-            line for line in content.splitlines()
-            if not line.strip().startswith("<!-- RETRY:")
-            and not line.strip().startswith("<!-- FAILED")
-            and not line.strip().startswith("<!-- FINAL FAILURE")
-            and not line.strip().startswith("<!-- Error:")
-            and not line.strip().startswith("<!-- Retries exhausted")
-        ]
-        clean_content = "\n".join(clean_lines).strip() + "\n"
-
-        # 写回 task_dir
-        dest_name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", src.name)
-        dest = task_dir / dest_name
-        dest.write_text(clean_content, encoding="utf-8")
-        src.unlink()
-
-        logger.info("重试任务: %s -> %s", src.name, dest.name)
-        return JSONResponse({"retried": dest.name})
+        return JSONResponse({"retried": retried[0]})
 
     # ── 删除任务 ─────────────────────────────────────────────
 

@@ -148,6 +148,65 @@ class TestFileSizeLimit:
         assert task is None
 
 
+class TestRetryFailed:
+    def test_retry_single(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        fail_dir = workspace / "tasks" / "failed"
+        # 模拟一个带时间戳前缀和错误注释的失败任务
+        failed_file = fail_dir / "20240101_120000_000000_001_hello.md"
+        failed_file.write_text(
+            "<!-- FINAL FAILURE at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: timeout -->\n"
+            "<!-- Retries exhausted: 2/2 -->\n"
+            "<!-- RETRY: 2 -->\n"
+            "do something\n",
+            encoding="utf-8",
+        )
+
+        retried = TaskQueue.retry_failed(task_dir, fail_dir, name="001_hello")
+        assert retried == ["001_hello.md"]
+        # 源文件已删除
+        assert not failed_file.exists()
+        # 目标文件存在且内容已清理
+        dest = task_dir / "001_hello.md"
+        assert dest.exists()
+        content = dest.read_text(encoding="utf-8")
+        assert "RETRY" not in content
+        assert "FAILED" not in content
+        assert "Error:" not in content
+        assert "do something" in content
+
+    def test_retry_all(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        fail_dir = workspace / "tasks" / "failed"
+        (fail_dir / "20240101_120000_000000_001_a.md").write_text(
+            "<!-- FINAL FAILURE at 2024-01-01 -->\ntask a\n", encoding="utf-8",
+        )
+        (fail_dir / "20240101_120001_000000_002_b.md").write_text(
+            "<!-- RETRY: 1 -->\ntask b\n", encoding="utf-8",
+        )
+
+        retried = TaskQueue.retry_failed(task_dir, fail_dir)
+        assert len(retried) == 2
+        assert (task_dir / "001_a.md").exists()
+        assert (task_dir / "002_b.md").exists()
+
+    def test_retry_empty(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        fail_dir = workspace / "tasks" / "failed"
+        retried = TaskQueue.retry_failed(task_dir, fail_dir)
+        assert retried == []
+
+    def test_retry_not_found(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        fail_dir = workspace / "tasks" / "failed"
+        (fail_dir / "20240101_120000_000000_001_hello.md").write_text(
+            "task\n", encoding="utf-8",
+        )
+        retried = TaskQueue.retry_failed(task_dir, fail_dir, name="nonexistent")
+        assert retried == []
+
+
 class TestRecover:
     def test_recover_running(self, workspace: Path):
         task_dir = workspace / "tasks"
