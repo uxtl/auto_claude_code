@@ -1,0 +1,166 @@
+"""任务模型 + 线程安全队列 — 文件级锁保证并行安全."""
+
+import logging
+import re
+import threading
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from .config import Config
+
+logger = logging.getLogger(__name__)
+
+_RETRY_PATTERN = re.compile(r"<!--\s*RETRY:\s*(\d+)\s*-->")
+
+
+@dataclass
+class Task:
+    """单个任务."""
+
+    path: Path
+    name: str
+    content: str
+    retries: int = 0
+
+
+class TaskQueue:
+    """线程安全的文件系统任务队列.
+
+    使用文件重命名（.running.{worker_id}）作为认领标记，
+    threading.Lock 保护扫描 + 重命名的原子性。
+    """
+
+    def __init__(self, config: Config, workspace: Path) -> None:
+        self._lock = threading.Lock()
+        self._config = config
+        self._workspace = workspace
+        self._task_dir = workspace / config.task_dir
+        self._done_dir = workspace / config.done_dir
+        self._fail_dir = workspace / config.fail_dir
+        # 确保目录存在
+        self._done_dir.mkdir(parents=True, exist_ok=True)
+        self._fail_dir.mkdir(parents=True, exist_ok=True)
+
+    def claim_next(self, worker_id: str) -> Task | None:
+        """原子性地认领下一个任务: rename task.md → task.md.running.{worker_id}."""
+        with self._lock:
+            pending = sorted(self._task_dir.glob("*.md"))
+            if not pending:
+                return None
+
+            task_file = pending[0]
+            running_name = f"{task_file.name}.running.{worker_id}"
+            running_path = self._task_dir / running_name
+
+            try:
+                task_file.rename(running_path)
+            except OSError as e:
+                logger.warning("认领任务 %s 失败: %s", task_file.name, e)
+                return None
+
+        # 读取内容（在锁外完成，减少持锁时间）
+        content = running_path.read_text(encoding="utf-8")
+        retries = _extract_retry_count(content)
+
+        return Task(
+            path=running_path,
+            name=task_file.stem,
+            content=content,
+            retries=retries,
+        )
+
+    def complete(self, task: Task) -> None:
+        """将完成的任务移到 done/ 目录（带时间戳）."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = self._done_dir / f"{timestamp}_{task.name}.md"
+        try:
+            task.path.rename(dest)
+            logger.info("任务已归档: %s → %s", task.name, dest.name)
+        except OSError as e:
+            logger.error("归档任务 %s 失败: %s", task.name, e)
+
+    def fail(self, task: Task, error: str) -> None:
+        """处理失败任务: 重试次数未达上限则重新排队，否则移到 failed/."""
+        new_retries = task.retries + 1
+
+        if new_retries < self._config.max_retries:
+            # 更新重试计数，改名回 .md 重新排队
+            content = _set_retry_count(task.content, new_retries)
+            fail_header = (
+                f"<!-- FAILED at {datetime.now().isoformat()} -->\n"
+                f"<!-- Error: {error} -->\n"
+            )
+            content = fail_header + content
+            # 恢复为 .md 文件
+            restored = self._task_dir / f"{task.name}.md"
+            restored.write_text(content, encoding="utf-8")
+            # 删除 .running 文件
+            try:
+                task.path.unlink()
+            except OSError:
+                pass
+            logger.info(
+                "任务 %s 将重试 (%d/%d)",
+                task.name,
+                new_retries,
+                self._config.max_retries,
+            )
+        else:
+            # 超过重试次数，移到 failed/
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = self._fail_dir / f"{timestamp}_{task.name}.md"
+            fail_header = (
+                f"<!-- FINAL FAILURE at {datetime.now().isoformat()} -->\n"
+                f"<!-- Error: {error} -->\n"
+                f"<!-- Retries exhausted: {new_retries}/{self._config.max_retries} -->\n"
+            )
+            content = fail_header + task.content
+            dest.write_text(content, encoding="utf-8")
+            try:
+                task.path.unlink()
+            except OSError:
+                pass
+            logger.info(
+                "任务 %s 重试次数耗尽，已移至 failed/: %s",
+                task.name,
+                dest.name,
+            )
+
+    @staticmethod
+    def recover_running(task_dir: Path) -> int:
+        """恢复所有 .running.* 文件为 .md（用于 crash 恢复）.
+
+        Returns:
+            恢复的任务数量
+        """
+        count = 0
+        for running_file in sorted(task_dir.glob("*.md.running.*")):
+            # 提取原始文件名: xxx.md.running.w0 → xxx.md
+            original_name = running_file.name.split(".running.")[0]
+            restored = task_dir / original_name
+            if restored.exists():
+                logger.warning("恢复冲突: %s 已存在，跳过", original_name)
+                continue
+            try:
+                running_file.rename(restored)
+                logger.info("已恢复: %s → %s", running_file.name, original_name)
+                count += 1
+            except OSError as e:
+                logger.error("恢复失败: %s: %s", running_file.name, e)
+        return count
+
+
+def _extract_retry_count(content: str) -> int:
+    """从任务内容中提取重试次数."""
+    match = _RETRY_PATTERN.search(content)
+    return int(match.group(1)) if match else 0
+
+
+def _set_retry_count(content: str, count: int) -> str:
+    """设置或更新任务内容中的重试次数标记."""
+    marker = f"<!-- RETRY: {count} -->"
+    if _RETRY_PATTERN.search(content):
+        return _RETRY_PATTERN.sub(marker, content)
+    # 添加到内容开头
+    return marker + "\n" + content

@@ -1,0 +1,29 @@
+services:
+  vibe:
+    build: .
+    volumes:
+      - ./:/app                          # 脚手架代码
+      - ${TARGET_PROJECT:-.}:/workspace  # 目标项目（默认当前目录）
+      - ./tasks:/workspace/tasks         # 任务队列
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - VIBE_MAX_WORKERS=${VIBE_MAX_WORKERS:-1}
+    ports:
+      - "${VIBE_PORT:-8080}:8080"
+    command: uv run python -m vibe run
+    working_dir: /workspace
+
+  test:
+    build: .
+    volumes:
+      - ./:/app:ro
+      - test_workspace:/workspace
+      - test_tasks:/workspace/tasks
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    working_dir: /workspace
+    entrypoint: ["bash"]
+
+volumes:
+  test_workspace:
+  test_tasks:
