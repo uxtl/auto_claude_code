@@ -139,10 +139,18 @@ def _execute_with_approval(
     logger.info("[%s] 计划已生成，等待人工审批: %s", worker_id, task_name)
     approval = approval_store.submit(task_name, worker_id, plan_text)
 
-    approval.wait()  # 阻塞直到 approve/reject
+    remaining_timeout = timeout - int(time.monotonic() - start_time)
+    if remaining_timeout < 60:
+        remaining_timeout = 60
+
+    approved = approval.wait(timeout=remaining_timeout)
 
     # 清理
     approval_store.remove(approval.approval_id)
+
+    if not approved:
+        logger.warning("[%s] 审批等待超时: %s", worker_id, task_name)
+        return TaskResult(success=False, error="审批等待超时")
 
     from .approval import ApprovalDecision
 

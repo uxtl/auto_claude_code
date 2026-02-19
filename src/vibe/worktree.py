@@ -3,6 +3,7 @@
 import logging
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -35,11 +36,12 @@ def create_worktree(workspace: Path, worker_id: str) -> Path:
     返回 worktree 路径。
     """
     timestamp = int(time.time())
-    wt_name = f"vibe-{worker_id}-{timestamp}"
+    uid = uuid.uuid4().hex[:6]
+    wt_name = f"vibe-{worker_id}-{timestamp}-{uid}"
     wt_path = Path(f"/tmp/{wt_name}")
 
     # 创建 detached worktree（基于 HEAD）
-    branch_name = f"vibe/{worker_id}-{timestamp}"
+    branch_name = f"vibe/{worker_id}-{timestamp}-{uid}"
     result = _run_git(
         ["worktree", "add", "-b", branch_name, str(wt_path), "HEAD"],
         workspace,

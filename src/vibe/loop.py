@@ -104,7 +104,7 @@ def _run_with_worktrees(
             for created_wid, created_path in worktrees.items():
                 remove_worktree(workspace, created_path)
             logger.warning("降级为共享 workspace 模式")
-            _run_shared(config, queue)
+            _run_shared(config, queue, approval_store=approval_store)
             return
 
     # 启动 workers
@@ -121,8 +121,14 @@ def _run_with_worktrees(
 
     # 逐个 merge worktree 的更改回主分支
     for wid, wt_path in worktrees.items():
-        commit_and_merge(workspace, wt_path, f"vibe: {wid} 任务完成")
-        remove_worktree(workspace, wt_path)
+        merged = commit_and_merge(workspace, wt_path, f"vibe: {wid} 任务完成")
+        if merged:
+            remove_worktree(workspace, wt_path)
+        else:
+            logger.warning(
+                "合并 %s 的 worktree 失败，保留 worktree 供手动处理: %s",
+                wid, wt_path,
+            )
 
 
 def _run_shared(

@@ -115,6 +115,8 @@ class TestRecover:
         (task_dir / "001_test.md.running.w0").write_text("dup", encoding="utf-8")
 
         count = TaskQueue.recover_running(task_dir)
-        assert count == 0
-        # running 文件保留（因为冲突被跳过）
-        assert (task_dir / "001_test.md.running.w0").exists()
+        assert count == 1
+        # running 文件被删除（因为 .md 已存在）
+        assert not (task_dir / "001_test.md.running.w0").exists()
+        # 原始 .md 文件保留
+        assert (task_dir / "001_test.md").read_text(encoding="utf-8") == "original"

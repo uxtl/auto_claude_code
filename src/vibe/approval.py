@@ -71,18 +71,18 @@ class ApprovalStore:
     def approve(self, approval_id: str) -> bool:
         with self._lock:
             item = self._items.get(approval_id)
-        if item is None:
-            return False
-        item.approve()
-        return True
+            if item is None:
+                return False
+            item.approve()
+            return True
 
     def reject(self, approval_id: str) -> bool:
         with self._lock:
             item = self._items.get(approval_id)
-        if item is None:
-            return False
-        item.reject()
-        return True
+            if item is None:
+                return False
+            item.reject()
+            return True
 
     def remove(self, approval_id: str) -> None:
         with self._lock:

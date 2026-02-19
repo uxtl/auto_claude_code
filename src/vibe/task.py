@@ -72,7 +72,7 @@ class TaskQueue:
 
     def complete(self, task: Task) -> None:
         """将完成的任务移到 done/ 目录（带时间戳）."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         dest = self._done_dir / f"{timestamp}_{task.name}.md"
         try:
             task.path.rename(dest)
@@ -92,14 +92,13 @@ class TaskQueue:
                 f"<!-- Error: {error} -->\n"
             )
             content = fail_header + content
-            # 恢复为 .md 文件
-            restored = self._task_dir / f"{task.name}.md"
-            restored.write_text(content, encoding="utf-8")
-            # 删除 .running 文件
+            # 先删除 .running 文件，再写入 .md（避免崩溃时两个文件同时存在）
             try:
                 task.path.unlink()
             except OSError:
                 pass
+            restored = self._task_dir / f"{task.name}.md"
+            restored.write_text(content, encoding="utf-8")
             logger.info(
                 "任务 %s 将重试 (%d/%d)",
                 task.name,
@@ -108,7 +107,7 @@ class TaskQueue:
             )
         else:
             # 超过重试次数，移到 failed/
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             dest = self._fail_dir / f"{timestamp}_{task.name}.md"
             fail_header = (
                 f"<!-- FINAL FAILURE at {datetime.now().isoformat()} -->\n"
@@ -116,11 +115,12 @@ class TaskQueue:
                 f"<!-- Retries exhausted: {new_retries}/{self._config.max_retries} -->\n"
             )
             content = fail_header + task.content
-            dest.write_text(content, encoding="utf-8")
+            # 先删除 .running 文件，再写入目标文件
             try:
                 task.path.unlink()
             except OSError:
                 pass
+            dest.write_text(content, encoding="utf-8")
             logger.info(
                 "任务 %s 重试次数耗尽，已移至 failed/: %s",
                 task.name,
@@ -140,7 +140,12 @@ class TaskQueue:
             original_name = running_file.name.split(".running.")[0]
             restored = task_dir / original_name
             if restored.exists():
-                logger.warning("恢复冲突: %s 已存在，跳过", original_name)
+                logger.warning("恢复冲突: %s 已存在，删除多余的 .running 文件", original_name)
+                try:
+                    running_file.unlink()
+                except OSError as e:
+                    logger.error("删除冲突 .running 文件失败: %s: %s", running_file.name, e)
+                count += 1
                 continue
             try:
                 running_file.rename(restored)

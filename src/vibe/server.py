@@ -1,6 +1,7 @@
 """FastAPI Web 管理界面 — 任务查看、添加、重试 + SSE 实时日志."""
 
 import asyncio
+import itertools
 import logging
 import re
 import threading
@@ -18,8 +19,9 @@ from .task import TaskQueue
 
 logger = logging.getLogger(__name__)
 
-# 全局日志缓冲（供 SSE 推送）
-_log_buffer: deque[str] = deque(maxlen=500)
+# 全局日志缓冲（供 SSE 推送），存储 (seq, msg) 元组
+_log_seq = itertools.count()
+_log_buffer: deque[tuple[int, str]] = deque(maxlen=500)
 _log_event = asyncio.Event()
 
 
@@ -28,7 +30,7 @@ class _SSELogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = self.format(record)
-        _log_buffer.append(msg)
+        _log_buffer.append((next(_log_seq), msg))
         try:
             _log_event.set()
         except RuntimeError:
@@ -54,6 +56,7 @@ def create_app(
     config.workspace = str(workspace)
 
     app = FastAPI(title="Vibe Manager", version="0.2.0")
+    _task_num_lock = threading.Lock()
 
     _install_log_handler()
 
@@ -85,13 +88,13 @@ def create_app(
         if done_dir.is_dir():
             for f in sorted(done_dir.glob("*.md")):
                 # 文件名格式: 20240101_120000_taskname.md
-                name = re.sub(r"^\d{8}_\d{6}_", "", f.stem)
+                name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem)
                 tasks.append({"name": name, "status": "done", "file": f.name})
 
         # failed
         if fail_dir.is_dir():
             for f in sorted(fail_dir.glob("*.md")):
-                name = re.sub(r"^\d{8}_\d{6}_", "", f.stem)
+                name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem)
                 tasks.append({"name": name, "status": "failed", "file": f.name})
 
         return tasks
@@ -112,20 +115,21 @@ def create_app(
         task_dir = workspace / config.task_dir
         task_dir.mkdir(parents=True, exist_ok=True)
 
-        # 自动编号
-        existing = sorted(task_dir.glob("*.md"))
-        max_num = 0
-        for f in existing:
-            parts = f.stem.split("_", 1)
-            try:
-                max_num = max(max_num, int(parts[0]))
-            except ValueError:
-                pass
-        next_num = max_num + 1
+        with _task_num_lock:
+            # 自动编号
+            existing = sorted(task_dir.glob("*.md"))
+            max_num = 0
+            for f in existing:
+                parts = f.stem.split("_", 1)
+                try:
+                    max_num = max(max_num, int(parts[0]))
+                except ValueError:
+                    pass
+            next_num = max_num + 1
 
-        slug = description[:30].replace(" ", "_").replace("/", "_")
-        filename = f"{next_num:03d}_{slug}.md"
-        (task_dir / filename).write_text(description + "\n", encoding="utf-8")
+            slug = description[:30].replace(" ", "_").replace("/", "_")
+            filename = f"{next_num:03d}_{slug}.md"
+            (task_dir / filename).write_text(description + "\n", encoding="utf-8")
         logger.info("通过 Web 添加任务: %s", filename)
         return JSONResponse({"filename": filename, "number": next_num}, status_code=201)
 
@@ -136,8 +140,11 @@ def create_app(
         fail_dir = workspace / config.fail_dir
         task_dir = workspace / config.task_dir
 
-        # 在 failed/ 中查找匹配的任务
-        matches = [f for f in fail_dir.glob("*.md") if name in f.stem]
+        # 在 failed/ 中查找匹配的任务（精确匹配，去除时间戳前缀后比较）
+        matches = [
+            f for f in fail_dir.glob("*.md")
+            if f.stem == name or re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem) == name
+        ]
         if not matches:
             return JSONResponse({"error": f"未找到失败任务: {name}"}, status_code=404)
 
@@ -155,7 +162,7 @@ def create_app(
         clean_content = "\n".join(clean_lines).strip() + "\n"
 
         # 写回 task_dir
-        dest_name = re.sub(r"^\d{8}_\d{6}_", "", src.name)
+        dest_name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", src.name)
         dest = task_dir / dest_name
         dest.write_text(clean_content, encoding="utf-8")
         src.unlink()
@@ -170,7 +177,10 @@ def create_app(
         task_dir = workspace / config.task_dir
         # 搜索 pending 和 failed
         for search_dir in [task_dir, workspace / config.fail_dir]:
-            matches = [f for f in search_dir.glob("*.md") if name in f.stem]
+            matches = [
+                f for f in search_dir.glob("*.md")
+                if f.stem == name or re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem) == name
+            ]
             if matches:
                 matches[0].unlink()
                 logger.info("删除任务: %s", matches[0].name)
@@ -189,10 +199,11 @@ def create_app(
     @app.get("/api/logs")
     async def stream_logs() -> StreamingResponse:
         async def _generator():
-            sent = len(_log_buffer)
+            last_seq = -1
             # 先发送已有日志
-            for msg in list(_log_buffer):
+            for seq, msg in list(_log_buffer):
                 yield f"data: {msg}\n\n"
+                last_seq = seq
             while True:
                 _log_event.clear()
                 try:
@@ -200,13 +211,10 @@ def create_app(
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
                     continue
-                while sent < len(_log_buffer):
-                    idx = sent - len(_log_buffer)  # 从 deque 尾部反推
-                    if idx >= 0:
-                        break
-                    yield f"data: {_log_buffer[idx]}\n\n"
-                    sent += 1
-                sent = len(_log_buffer)
+                for seq, msg in list(_log_buffer):
+                    if seq > last_seq:
+                        yield f"data: {msg}\n\n"
+                        last_seq = seq
 
         return StreamingResponse(_generator(), media_type="text/event-stream")
 

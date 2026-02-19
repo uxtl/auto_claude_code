@@ -29,10 +29,12 @@ class TaskResult:
 
 def _read_stream(stream, lines: list[str]) -> None:
     """在线程中读取子进程的输出流."""
-    for raw_line in stream:
-        line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
-        lines.append(line)
-    stream.close()
+    try:
+        for raw_line in stream:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            lines.append(line)
+    finally:
+        stream.close()
 
 
 def _parse_stream_json(lines: list[str]) -> TaskResult:
@@ -248,8 +250,8 @@ def _run_claude(
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
 
-    stdout_thread = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines))
-    stderr_thread = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_lines))
+    stdout_thread = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines), daemon=True)
+    stderr_thread = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_lines), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
 

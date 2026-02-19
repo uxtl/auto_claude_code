@@ -1,8 +1,11 @@
 """集中配置 — 从默认值 / .env / 环境变量加载."""
 
+import logging
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,10 +65,14 @@ def _parse_dotenv(path: Path) -> dict[str, str]:
     return result
 
 
-def _coerce(value: str, target_type: type) -> object:
-    """将字符串值转换为目标类型."""
+def _coerce(value: str, target_type: type, field_name: str = "") -> object | None:
+    """将字符串值转换为目标类型. 转换失败返回 None."""
     if target_type is int:
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            logger.warning("配置项 %s 值 %r 无法转为 int，保留默认值", field_name, value)
+            return None
     if target_type is bool:
         return value.lower() in ("1", "true", "yes")
     return value
@@ -92,6 +99,19 @@ def load_config(workspace: Path | None = None) -> Config:
         # 环境变量覆盖
         raw = os.environ.get(env_key, raw)
         if raw is not None:
-            setattr(config, f.name, _coerce(raw, f.type))
+            coerced = _coerce(raw, f.type, f.name)
+            if coerced is not None:
+                setattr(config, f.name, coerced)
+
+    # 范围校验
+    if config.timeout <= 0:
+        logger.warning("timeout=%d 无效，重置为 600", config.timeout)
+        config.timeout = 600
+    if config.max_retries < 0:
+        logger.warning("max_retries=%d 无效，重置为 2", config.max_retries)
+        config.max_retries = 2
+    if config.max_workers < 1:
+        logger.warning("max_workers=%d 无效，重置为 1", config.max_workers)
+        config.max_workers = 1
 
     return config
