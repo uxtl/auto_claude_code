@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
+import pytest
+
 from vibe.config import Config
 from vibe.loop import run_loop
 
@@ -80,3 +82,52 @@ class TestRunLoop:
         mock_remove.assert_called_once()
         # 共享模式仍然运行 worker
         assert mock_wl.call_count == 2
+
+
+class TestDockerPreCheck:
+    def test_docker_unavailable_raises(self, workspace: Path):
+        """use_docker=True + Docker 不可用 → RuntimeError."""
+        cfg = Config(workspace=str(workspace), use_docker=True)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.check_docker_available", return_value=(False, "not installed")),
+            pytest.raises(RuntimeError, match="Docker 不可用"),
+        ):
+            run_loop(cfg)
+
+    def test_docker_image_missing_raises(self, workspace: Path):
+        """use_docker=True + 镜像不存在且构建失败 → RuntimeError."""
+        cfg = Config(workspace=str(workspace), use_docker=True)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.check_docker_available", return_value=(True, "ok")),
+            patch("vibe.loop.ensure_docker_image", return_value=(False, "no Dockerfile")),
+            pytest.raises(RuntimeError, match="镜像准备失败"),
+        ):
+            run_loop(cfg)
+
+    def test_docker_ok_continues(self, workspace: Path):
+        """use_docker=True + Docker 正常 → 正常执行."""
+        cfg = Config(workspace=str(workspace), use_docker=True)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.check_docker_available", return_value=(True, "ok")),
+            patch("vibe.loop.ensure_docker_image", return_value=(True, "exists")),
+            patch("vibe.loop.worker_loop") as mock_wl,
+        ):
+            run_loop(cfg)
+        mock_wl.assert_called_once()
+
+    def test_no_docker_skips_checks(self, config: Config, workspace: Path):
+        """use_docker=False → 不调用 Docker 检查."""
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.check_docker_available") as mock_check,
+            patch("vibe.loop.worker_loop"),
+        ):
+            run_loop(config)
+        mock_check.assert_not_called()

@@ -25,6 +25,9 @@ class Config:
     use_worktree: bool = True
     plan_mode: bool = False
     plan_auto_approve: bool = True
+    use_docker: bool = False
+    docker_image: str = "auto-claude-code"
+    docker_extra_args: str = ""
 
 
 _ENV_PREFIX = "VIBE_"

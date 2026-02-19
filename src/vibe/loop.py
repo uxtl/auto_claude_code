@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .approval import ApprovalStore
 from .config import Config
+from .manager import check_docker_available, ensure_docker_image
 from .task import TaskQueue
 from .worker import worker_loop
 from .worktree import (
@@ -29,6 +30,16 @@ def run_loop(config: Config, approval_store: ApprovalStore | None = None) -> Non
     """
     workspace = Path(config.workspace).resolve()
     config.workspace = str(workspace)
+
+    # Docker 预检
+    if config.use_docker:
+        ok, msg = check_docker_available()
+        if not ok:
+            raise RuntimeError(f"Docker 隔离模式启用但 Docker 不可用: {msg}")
+        ok, msg = ensure_docker_image(config.docker_image, workspace)
+        if not ok:
+            raise RuntimeError(f"Docker 镜像准备失败: {msg}")
+        logger.info("Docker 隔离模式已启用，镜像: %s", config.docker_image)
 
     logger.info("Vibe Loop 启动，工作目录: %s", workspace)
     logger.info("任务目录: %s", workspace / config.task_dir)

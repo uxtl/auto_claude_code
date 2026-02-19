@@ -82,3 +82,27 @@ class TestLoadConfig:
         assert cfg.use_worktree is True
         assert cfg.plan_mode is False
         assert cfg.plan_auto_approve is True
+
+    def test_docker_defaults(self, tmp_path: Path):
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.use_docker is False
+        assert cfg.docker_image == "auto-claude-code"
+        assert cfg.docker_extra_args == ""
+
+    def test_docker_env_override(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("VIBE_USE_DOCKER", "true")
+        monkeypatch.setenv("VIBE_DOCKER_IMAGE", "my-image")
+        monkeypatch.setenv("VIBE_DOCKER_EXTRA_ARGS", "--network=none --memory=4g")
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.use_docker is True
+        assert cfg.docker_image == "my-image"
+        assert cfg.docker_extra_args == "--network=none --memory=4g"
+
+    def test_docker_dotenv(self, tmp_path: Path):
+        (tmp_path / ".env").write_text(
+            "VIBE_USE_DOCKER=true\nVIBE_DOCKER_IMAGE=custom\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.use_docker is True
+        assert cfg.docker_image == "custom"

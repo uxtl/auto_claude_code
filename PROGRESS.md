@@ -18,6 +18,7 @@
 | `__main__` | `src/vibe/__main__.py` | CLI 入口（run / serve / list / add / recover 子命令） |
 | `worktree` | `src/vibe/worktree.py` | Git worktree 生命周期（创建/合并/清理） |
 | `server` | `src/vibe/server.py` | FastAPI Web 管理界面 + SSE 日志推送 |
+| `approval` | `src/vibe/approval.py` | 线程安全的 Plan 审批流程（Event 同步 + 内存存储） |
 
 ### 关键文件
 
@@ -37,7 +38,8 @@ __main__.run / __main__.serve
       → [多 worker + git repo] worktree.create_worktree() per worker
       → worker_loop("w{i}", config, queue, worktree?)  × max_workers
           → worker.build_prompt(task_content)
-          → [plan_mode] manager.run_plan()  → step1: 生成计划 → step2: run_task(计划)
+          → [plan_mode + auto_approve]  manager.run_plan() → generate_plan() → execute_plan()
+          → [plan_mode + !auto_approve] generate_plan() → approval.wait() → execute_plan()
           → [normal]    manager.run_task(prompt, cwd, timeout)
               → subprocess: claude -p ... --output-format stream-json
               → _parse_stream_json → TaskResult
@@ -46,8 +48,9 @@ __main__.run / __main__.serve
 
 __main__.serve
   → server.start_server(config, host, port)
-      → threading.Thread(run_loop)  # 后台任务循环
-      → uvicorn.run(FastAPI app)    # Web 管理界面
+      → ApprovalStore()             # 共享审批实例
+      → threading.Thread(run_loop(approval_store=...))  # 后台任务循环
+      → uvicorn.run(FastAPI app)    # Web 管理界面 + 审批 API
 ```
 
 ## 经验教训
@@ -110,6 +113,15 @@ __main__.serve
 - 计划阶段超时限制为总超时的 1/3 或 5 分钟（取较小值）
 - 计划内容记录到任务输出中便于审计
 
+### Phase 5: Plan Mode 人工审批流程
+- **approval.py**: 新增模块 — `ApprovalDecision` 枚举、`PendingApproval` 数据类（含 `threading.Event` 同步）、`ApprovalStore` 线程安全存储（submit/get/list_pending/approve/reject/remove）
+- **manager.py**: 拆分 `run_plan()` → `generate_plan()` + `execute_plan()`，原 `run_plan()` 保留为向后兼容包装
+- **worker.py**: 新增 `_execute_with_approval()` 审批路由 — 当 `plan_auto_approve=False` 且有 `approval_store` 时走人工审批流程
+- **loop.py**: `run_loop()` / `worker_loop()` 透传 `approval_store` 参数
+- **server.py**: 3 个审批 API 端点 — `GET /api/approvals`、`POST /api/approvals/{id}/approve`、`POST /api/approvals/{id}/reject`；`start_server()` 创建共享 `ApprovalStore` 并传入 `run_loop`
+- **dashboard.html**: Awaiting Approval 计数器 + Pending Approvals 卡片（显示计划文本、approve/reject 按钮）+ 3 秒轮询
+- **__main__.py**: CLI 模式（`run` 子命令）自动覆盖 `plan_auto_approve=True` 并输出警告，因 CLI 无 web UI 无法审批
+
 ## 经验教训（Phase 3 新增）
 
 ### Git Worktree
@@ -126,8 +138,29 @@ __main__.serve
 - 两步执行的关键：第一步不带 `--dangerously-skip-permissions` 确保计划阶段安全
 - 超时分配策略：计划阶段占 1/3，执行阶段用剩余时间
 
+### 人工审批（Phase 5 新增）
+- `threading.Event` 作为 worker⇔FastAPI 线程间同步原语，简单高效：worker 阻塞等待 `event.wait()`，web handler 调用 `event.set()` 唤醒
+- `ApprovalStore` 的 submit/wait/remove 生命周期需注意清理：无论 approve 还是 reject，worker 完成后应 `remove()` 避免内存泄漏
+- CLI 模式无 web UI，强制 `plan_auto_approve=True` 是合理的降级策略
+
+### Phase 6: Docker 隔离模式
+- **config.py**: 新增 3 个配置字段 — `use_docker: bool = False`、`docker_image: str = "auto-claude-code"`、`docker_extra_args: str = ""`，通过 `VIBE_USE_DOCKER` / `VIBE_DOCKER_IMAGE` / `VIBE_DOCKER_EXTRA_ARGS` 环境变量加载
+- **manager.py**: 核心重构 — 提取 `_run_claude()` 公共子进程管理函数（消除 `run_task` 和 `generate_plan` 中的重复代码）；新增 `_build_docker_cmd()` 将 claude 命令包装为 `docker run`；新增 `check_docker_available()` 和 `ensure_docker_image()` 预检函数；所有公开 API（`run_task`/`generate_plan`/`execute_plan`/`run_plan`）新增 `use_docker`/`docker_image`/`docker_extra_args` 关键字参数
+- **worker.py**: 新增 `_docker_kwargs(config)` 辅助函数，`_execute_task()` 和 `_execute_with_approval()` 中所有 manager 调用透传 Docker 参数
+- **loop.py**: `run_loop()` 开头增加 Docker 预检（`check_docker_available` + `ensure_docker_image`），失败则 `raise RuntimeError`
+- **__main__.py**: `run` 和 `serve` 子命令新增 `--docker` 和 `--docker-image` CLI 参数
+- Docker 模式下：工作目录通过 `-v {cwd}:/workspace -w /workspace` 挂载，`ANTHROPIC_API_KEY` 通过 `-e` 传递，容器 `--rm -i` 一次性使用
+- 完全向后兼容：`use_docker=False`（默认）时行为与之前完全一致
+
+## 经验教训（Phase 6 新增）
+
+### Docker 隔离
+- 子进程管理逻辑重复是重构的好时机：`_run_claude()` 统一了 Popen + 双线程读取 + 超时 + 解析流程，Docker 包装只在最外层切换命令
+- Docker 模式下 `cwd` 参数设为 `None`（通过 `-w /workspace` 控制），避免宿主机路径泄露
+- `ensure_docker_image()` 自动检测并构建，降低首次使用门槛
+- 额外参数通过 `shlex.split()` 解析字符串，允许用户灵活传递 `--network=none --memory=4g` 等
+
 ## 待确认问题
 
 - **权限安全门控**: 当前使用 `--dangerously-skip-permissions`，是否需要提供可选的交互式权限确认模式？
-- **Plan Mode 人工审批**: `plan_auto_approve=False` 时通过 web UI 等待确认的交互流程尚未实现
 - **下一阶段优先级**: 测试覆盖 / 任务依赖图 / CI/CD 集成 — 哪个优先？

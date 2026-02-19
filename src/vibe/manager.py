@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shlex
 import subprocess
 import threading
 import time
@@ -95,43 +96,152 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
     )
 
 
-def run_task(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> TaskResult:
-    """启动 Claude Code 执行任务，等待完成并返回结构化结果.
+# ── Docker 支持 ─────────────────────────────────────────────
+
+
+def _build_docker_cmd(
+    claude_cmd: list[str],
+    cwd: Path,
+    docker_image: str,
+    docker_extra_args: str = "",
+) -> list[str]:
+    """将 claude 命令包装为 docker run 命令.
 
     Args:
-        prompt: 发送给 Claude Code 的任务提示词
-        cwd: 工作目录（目标项目根目录）
-        timeout: 超时秒数，默认 600（10 分钟）
+        claude_cmd: 原始 claude CLI 命令列表
+        cwd: 宿主机工作目录（挂载到 /workspace）
+        docker_image: Docker 镜像名称
+        docker_extra_args: 额外 docker run 参数字符串
+    """
+    cmd = [
+        "docker", "run",
+        "--rm", "-i",
+        "-v", f"{cwd}:/workspace",
+        "-w", "/workspace",
+        "-e", "ANTHROPIC_API_KEY",
+    ]
+    if docker_extra_args:
+        cmd.extend(shlex.split(docker_extra_args))
+    cmd.append(docker_image)
+    cmd.extend(claude_cmd)
+    return cmd
+
+
+def check_docker_available() -> tuple[bool, str]:
+    """检查 Docker 是否可用.
 
     Returns:
-        TaskResult 包含执行结果
+        (可用, 消息) 元组
     """
-    cwd = Path(cwd).resolve()
-    logger.info("启动 Claude Code 任务，工作目录: %s", cwd)
-    logger.debug("Prompt:\n%s", prompt)
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True, "Docker 可用"
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        return False, f"Docker 不可用: {stderr}"
+    except FileNotFoundError:
+        return False, "docker 命令未找到，请安装 Docker"
+    except subprocess.TimeoutExpired:
+        return False, "docker info 超时"
+    except (OSError, PermissionError) as e:
+        return False, f"Docker 检查失败: {e}"
 
-    cmd = [
-        "claude",
-        "-p", prompt,
-        "--dangerously-skip-permissions",
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
+
+def ensure_docker_image(image: str, dockerfile_dir: str | Path = ".") -> tuple[bool, str]:
+    """检查镜像是否存在，不存在时尝试自动构建.
+
+    Args:
+        image: 镜像名称
+        dockerfile_dir: Dockerfile 所在目录
+
+    Returns:
+        (成功, 消息) 元组
+    """
+    # 检查镜像是否已存在
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True, f"镜像 {image} 已存在"
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False, "docker 命令不可用"
+
+    # 镜像不存在，尝试构建
+    dockerfile_path = Path(dockerfile_dir) / "Dockerfile"
+    if not dockerfile_path.is_file():
+        return False, f"镜像 {image} 不存在且未找到 Dockerfile: {dockerfile_path}"
+
+    logger.info("镜像 %s 不存在，开始自动构建...", image)
+    try:
+        result = subprocess.run(
+            ["docker", "build", "-t", image, str(dockerfile_dir)],
+            capture_output=True,
+            timeout=600,
+        )
+        if result.returncode == 0:
+            return True, f"镜像 {image} 构建成功"
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        return False, f"镜像 {image} 构建失败: {stderr}"
+    except subprocess.TimeoutExpired:
+        return False, f"镜像 {image} 构建超时"
+    except (OSError, PermissionError) as e:
+        return False, f"镜像构建失败: {e}"
+
+
+# ── 公共子进程管理 ──────────────────────────────────────────
+
+
+def _run_claude(
+    cmd: list[str],
+    cwd: Path,
+    timeout: int,
+    *,
+    use_docker: bool = False,
+    docker_image: str = "auto-claude-code",
+    docker_extra_args: str = "",
+) -> TaskResult:
+    """执行 claude 命令的公共子进程管理逻辑.
+
+    处理 Popen 启动、双线程读取 stdout/stderr、超时、结果解析。
+    当 use_docker=True 时自动将命令包装为 docker run。
+
+    Args:
+        cmd: claude CLI 命令列表
+        cwd: 工作目录
+        timeout: 超时秒数
+        use_docker: 是否使用 Docker 包装
+        docker_image: Docker 镜像名
+        docker_extra_args: 额外 docker run 参数
+    """
+    if use_docker:
+        actual_cmd = _build_docker_cmd(cmd, cwd, docker_image, docker_extra_args)
+        proc_cwd = None  # Docker 模式下 cwd 通过 -w /workspace 指定
+    else:
+        actual_cmd = cmd
+        proc_cwd = str(cwd)
 
     start_time = time.monotonic()
 
     try:
         proc = subprocess.Popen(
-            cmd,
+            actual_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=str(cwd),
+            cwd=proc_cwd,
         )
     except FileNotFoundError:
-        logger.error("claude 命令未找到，请确认 Claude Code 已安装")
-        return TaskResult(success=False, error="claude 命令未找到")
+        bin_name = "docker" if use_docker else "claude"
+        logger.error("%s 命令未找到", bin_name)
+        return TaskResult(success=False, error=f"{bin_name} 命令未找到")
     except (OSError, PermissionError) as e:
-        logger.error("启动 Claude Code 失败: %s", e)
+        logger.error("启动失败: %s", e)
         return TaskResult(success=False, error=f"启动失败: {e}")
 
     # 使用线程读取 stdout 和 stderr，避免死锁
@@ -147,7 +257,7 @@ def run_task(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> Ta
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         duration = time.monotonic() - start_time
-        logger.warning("Claude Code 执行超时（%d 秒），终止进程", timeout)
+        logger.warning("执行超时（%d 秒），终止进程", timeout)
         proc.kill()
         proc.wait()
         stdout_thread.join(timeout=5)
@@ -166,7 +276,7 @@ def run_task(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> Ta
 
     stderr_text = "\n".join(stderr_lines)
     if proc.returncode != 0:
-        logger.error("Claude Code 退出码 %d, stderr: %s", proc.returncode, stderr_text)
+        logger.error("退出码 %d, stderr: %s", proc.returncode, stderr_text)
         return TaskResult(
             success=False,
             error=f"退出码 {proc.returncode}: {stderr_text}",
@@ -179,16 +289,69 @@ def run_task(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> Ta
     result = _parse_stream_json(stdout_lines)
     result.duration_seconds = duration
     result.return_code = proc.returncode
-    logger.info(
-        "任务完成: 修改了 %d 个文件, 调用了 %d 次工具, 耗时 %.1fs",
-        len(result.files_changed),
-        len(result.tool_calls),
-        duration,
-    )
     return result
 
 
-def generate_plan(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> TaskResult:
+# ── 公开 API ────────────────────────────────────────────────
+
+
+def run_task(
+    prompt: str,
+    cwd: str | Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    use_docker: bool = False,
+    docker_image: str = "auto-claude-code",
+    docker_extra_args: str = "",
+) -> TaskResult:
+    """启动 Claude Code 执行任务，等待完成并返回结构化结果.
+
+    Args:
+        prompt: 发送给 Claude Code 的任务提示词
+        cwd: 工作目录（目标项目根目录）
+        timeout: 超时秒数，默认 600（10 分钟）
+        use_docker: 是否在 Docker 容器中执行
+        docker_image: Docker 镜像名
+        docker_extra_args: 额外 docker run 参数
+    """
+    cwd = Path(cwd).resolve()
+    logger.info("启动 Claude Code 任务，工作目录: %s", cwd)
+    logger.debug("Prompt:\n%s", prompt)
+
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--output-format", "stream-json",
+        "--verbose",
+    ]
+
+    result = _run_claude(
+        cmd, cwd, timeout,
+        use_docker=use_docker,
+        docker_image=docker_image,
+        docker_extra_args=docker_extra_args,
+    )
+
+    if result.success:
+        logger.info(
+            "任务完成: 修改了 %d 个文件, 调用了 %d 次工具, 耗时 %.1fs",
+            len(result.files_changed),
+            len(result.tool_calls),
+            result.duration_seconds,
+        )
+    return result
+
+
+def generate_plan(
+    prompt: str,
+    cwd: str | Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    use_docker: bool = False,
+    docker_image: str = "auto-claude-code",
+    docker_extra_args: str = "",
+) -> TaskResult:
     """生成执行计划（不带 --dangerously-skip-permissions）.
 
     Returns:
@@ -209,58 +372,32 @@ def generate_plan(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) 
         "--verbose",
     ]
 
-    start_time = time.monotonic()
+    plan_timeout = min(timeout // 3, 300)
+    result = _run_claude(
+        plan_cmd, cwd, plan_timeout,
+        use_docker=use_docker,
+        docker_image=docker_image,
+        docker_extra_args=docker_extra_args,
+    )
 
-    try:
-        proc = subprocess.Popen(
-            plan_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(cwd),
-        )
-    except FileNotFoundError:
-        return TaskResult(success=False, error="claude 命令未找到")
-    except (OSError, PermissionError) as e:
-        return TaskResult(success=False, error=f"启动失败: {e}")
+    if not result.success and "超时" in result.error:
+        result.error = f"计划生成超时（{plan_timeout} 秒）"
+    elif not result.success and "退出码" in result.error:
+        result.error = f"计划生成失败（{result.error}）"
 
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    stdout_thread = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines))
-    stderr_thread = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_lines))
-    stdout_thread.start()
-    stderr_thread.start()
-
-    plan_timeout = min(timeout // 3, 300)  # 计划阶段最多用 1/3 时间或 5 分钟
-    try:
-        proc.wait(timeout=plan_timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        return TaskResult(
-            success=False,
-            error=f"计划生成超时（{plan_timeout} 秒）",
-            duration_seconds=time.monotonic() - start_time,
-        )
-
-    stdout_thread.join(timeout=10)
-    stderr_thread.join(timeout=10)
-
-    if proc.returncode != 0:
-        return TaskResult(
-            success=False,
-            error=f"计划生成失败（退出码 {proc.returncode}）",
-            output="\n".join(stdout_lines),
-            duration_seconds=time.monotonic() - start_time,
-            return_code=proc.returncode,
-        )
-
-    plan_result = _parse_stream_json(stdout_lines)
-    plan_result.duration_seconds = time.monotonic() - start_time
-    logger.info("[Plan Mode] 计划生成完成:\n%s", plan_result.output[:500])
-    return plan_result
+    if result.success:
+        logger.info("[Plan Mode] 计划生成完成:\n%s", result.output[:500])
+    return result
 
 
 def execute_plan(
-    plan_text: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT
+    plan_text: str,
+    cwd: str | Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    use_docker: bool = False,
+    docker_image: str = "auto-claude-code",
+    docker_extra_args: str = "",
 ) -> TaskResult:
     """按计划执行（带 --dangerously-skip-permissions），自动前缀 [计划]/[执行结果].
 
@@ -268,6 +405,9 @@ def execute_plan(
         plan_text: generate_plan() 返回的计划文本
         cwd: 工作目录
         timeout: 执行超时秒数
+        use_docker: 是否在 Docker 容器中执行
+        docker_image: Docker 镜像名
+        docker_extra_args: 额外 docker run 参数
     """
     logger.info("[Plan Mode] 第二步：按计划执行")
     exec_prompt = (
@@ -276,7 +416,12 @@ def execute_plan(
         "现在开始执行上述计划。"
     )
 
-    exec_result = run_task(exec_prompt, cwd=cwd, timeout=timeout)
+    exec_result = run_task(
+        exec_prompt, cwd=cwd, timeout=timeout,
+        use_docker=use_docker,
+        docker_image=docker_image,
+        docker_extra_args=docker_extra_args,
+    )
 
     # 将计划内容附加到输出前面
     if exec_result.output:
@@ -287,11 +432,24 @@ def execute_plan(
     return exec_result
 
 
-def run_plan(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> TaskResult:
+def run_plan(
+    prompt: str,
+    cwd: str | Path,
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    use_docker: bool = False,
+    docker_image: str = "auto-claude-code",
+    docker_extra_args: str = "",
+) -> TaskResult:
     """Plan 模式：先生成计划，再按计划执行（向后兼容包装）."""
     start_time = time.monotonic()
 
-    plan_result = generate_plan(prompt, cwd=cwd, timeout=timeout)
+    plan_result = generate_plan(
+        prompt, cwd=cwd, timeout=timeout,
+        use_docker=use_docker,
+        docker_image=docker_image,
+        docker_extra_args=docker_extra_args,
+    )
     if not plan_result.success:
         return plan_result
 
@@ -299,6 +457,11 @@ def run_plan(prompt: str, cwd: str | Path, timeout: int = DEFAULT_TIMEOUT) -> Ta
     if remaining_timeout < 60:
         remaining_timeout = 60
 
-    exec_result = execute_plan(plan_result.output, cwd=cwd, timeout=remaining_timeout)
+    exec_result = execute_plan(
+        plan_result.output, cwd=cwd, timeout=remaining_timeout,
+        use_docker=use_docker,
+        docker_image=docker_image,
+        docker_extra_args=docker_extra_args,
+    )
     exec_result.duration_seconds = time.monotonic() - start_time
     return exec_result

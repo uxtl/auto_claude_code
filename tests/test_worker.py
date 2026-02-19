@@ -8,7 +8,7 @@ from vibe.approval import ApprovalStore
 from vibe.config import Config
 from vibe.manager import TaskResult
 from vibe.task import Task, TaskQueue
-from vibe.worker import PROMPT_PREFIX, PROMPT_SUFFIX, build_prompt, worker_loop
+from vibe.worker import PROMPT_PREFIX, PROMPT_SUFFIX, _docker_kwargs, build_prompt, worker_loop
 
 
 class TestBuildPrompt:
@@ -166,3 +166,57 @@ class TestApprovalFlow:
         mock_plan.assert_called_once()
         # store 中不应有任何审批记录
         assert store.list_pending() == []
+
+
+class TestDockerKwargs:
+    def test_default_config(self):
+        cfg = Config()
+        kw = _docker_kwargs(cfg)
+        assert kw == {
+            "use_docker": False,
+            "docker_image": "auto-claude-code",
+            "docker_extra_args": "",
+        }
+
+    def test_custom_config(self):
+        cfg = Config(use_docker=True, docker_image="my-img", docker_extra_args="--net=none")
+        kw = _docker_kwargs(cfg)
+        assert kw == {
+            "use_docker": True,
+            "docker_image": "my-img",
+            "docker_extra_args": "--net=none",
+        }
+
+    def test_docker_kwargs_passed_to_run_task(self, workspace: Path):
+        """Docker kwargs 被正确传递到 manager.run_task."""
+        cfg = Config(workspace=str(workspace), use_docker=True, docker_image="test-img")
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="ok", duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result) as mock_run:
+            worker_loop("w0", cfg, q)
+
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["use_docker"] is True
+        assert kwargs["docker_image"] == "test-img"
+        assert kwargs["docker_extra_args"] == ""
+
+    def test_docker_kwargs_passed_to_run_plan(self, workspace: Path):
+        """Docker kwargs 被正确传递到 manager.run_plan."""
+        cfg = Config(
+            workspace=str(workspace), plan_mode=True,
+            use_docker=True, docker_image="plan-img",
+        )
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="ok", duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_plan", return_value=mock_result) as mock_plan:
+            worker_loop("w0", cfg, q)
+
+        mock_plan.assert_called_once()
+        _, kwargs = mock_plan.call_args
+        assert kwargs["use_docker"] is True
+        assert kwargs["docker_image"] == "plan-img"
