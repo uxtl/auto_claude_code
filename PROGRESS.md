@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-**项目名称**: Claude Vibe Scaffold (`claude-vibe-scaffold`)
+**项目名称**: auto_claude_code
 **定位**: 并行 Claude Code 任务执行脚手架 — 基于文件队列的自动化开发 agent 调度框架
 **技术栈**: Python 3.11+, uv, Docker (Ubuntu 24.04), Claude Code CLI
 

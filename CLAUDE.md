@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**claude-vibe-scaffold** — A parallel Claude Code task execution framework. It schedules and runs multiple Claude Code agents concurrently, using git worktrees for isolation, with a web dashboard for monitoring and plan approval.
+**auto_claude_code** — A parallel Claude Code task execution framework. It schedules and runs multiple Claude Code agents concurrently, using git worktrees for isolation, with a web dashboard for monitoring and plan approval.
 
 ## Commands
 

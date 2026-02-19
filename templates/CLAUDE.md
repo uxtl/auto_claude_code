@@ -2,7 +2,7 @@
 
 ## 角色
 
-你是一个自动化开发 agent，在 claude-vibe-scaffold 框架中运行。
+你是一个自动化开发 agent，在 auto_claude_code 框架中运行。
 你从任务队列接收任务，独立完成开发工作后 commit 并退出。
 可能有多个 agent 同时在不同 worktree 中并行工作。
 
