@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 from . import manager
@@ -13,6 +14,9 @@ from .task import Task, TaskQueue
 
 PROMPT_PREFIX = "先阅读 PROGRESS.md 了解项目历史和经验，然后执行以下任务：\n\n"
 PROMPT_SUFFIX = "\n\n完成后，将本次经验教训更新到 PROGRESS.md。"
+
+# 模块级关闭事件，供信号处理器通知所有 worker 退出
+shutdown_event = threading.Event()
 
 
 def build_prompt(task_content: str) -> str:
@@ -50,7 +54,7 @@ def worker_loop(
     cwd = str(worktree) if worktree else config.workspace
     logger.info("[%s] Worker 启动, cwd=%s", worker_id, cwd)
 
-    while True:
+    while not shutdown_event.is_set():
         task = queue.claim_next(worker_id)
         if task is None:
             logger.info("[%s] 队列为空，Worker 退出", worker_id)
@@ -58,6 +62,8 @@ def worker_loop(
 
         logger.info("[%s] 认领任务: %s", worker_id, task.name)
         _execute_task(worker_id, config, queue, task, cwd, approval_store)
+
+    logger.info("[%s] 收到关闭信号，Worker 退出", worker_id)
 
 
 def _execute_task(

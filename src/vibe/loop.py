@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -10,7 +12,7 @@ from .approval import ApprovalStore
 from .config import Config
 from .manager import check_docker_available, ensure_docker_image
 from .task import TaskQueue
-from .worker import worker_loop
+from .worker import shutdown_event, worker_loop
 from .worktree import (
     cleanup_stale_worktrees,
     commit_and_merge,
@@ -41,14 +43,36 @@ def run_loop(config: Config, approval_store: ApprovalStore | None = None) -> Non
             raise RuntimeError(f"Docker 镜像准备失败: {msg}")
         logger.info("Docker 隔离模式已启用，镜像: %s", config.docker_image)
 
+    # 注册信号处理器，优雅关闭
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.info("收到信号 %s，正在优雅关闭...", sig_name)
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _signal_handler)
+        except (OSError, ValueError):
+            pass  # 非主线程中无法注册信号处理器
+
+    task_dir = workspace / config.task_dir
+
+    # 注册 atexit 清理: 恢复孤立的 .running 任务
+    def _atexit_recover():
+        if task_dir.is_dir():
+            count = TaskQueue.recover_running(task_dir)
+            if count:
+                logger.info("atexit: 已恢复 %d 个孤立的 .running 任务", count)
+
+    atexit.register(_atexit_recover)
+
     logger.info("Vibe Loop 启动，工作目录: %s", workspace)
-    logger.info("任务目录: %s", workspace / config.task_dir)
+    logger.info("任务目录: %s", task_dir)
     logger.info("Worker 数量: %d", config.max_workers)
 
     queue = TaskQueue(config, workspace)
 
     # 检查是否有待执行任务
-    task_dir = workspace / config.task_dir
     pending = sorted(task_dir.glob("*.md"))
     if not pending:
         logger.info("没有待执行的任务，退出")

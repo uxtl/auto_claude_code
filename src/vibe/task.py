@@ -1,7 +1,9 @@
 """任务模型 + 线程安全队列 — 文件级锁保证并行安全."""
 
 import logging
+import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -60,6 +62,16 @@ class TaskQueue:
                 return None
 
         # 读取内容（在锁外完成，减少持锁时间）
+        try:
+            file_size = running_path.stat().st_size
+        except OSError:
+            file_size = 0
+        if file_size > _MAX_TASK_FILE_SIZE:
+            logger.error(
+                "任务文件 %s 过大 (%d bytes > %d)，跳过",
+                running_path.name, file_size, _MAX_TASK_FILE_SIZE,
+            )
+            return None
         content = running_path.read_text(encoding="utf-8")
         retries = _extract_retry_count(content)
 
@@ -81,7 +93,10 @@ class TaskQueue:
             logger.error("归档任务 %s 失败: %s", task.name, e)
 
     def fail(self, task: Task, error: str) -> None:
-        """处理失败任务: 重试次数未达上限则重新排队，否则移到 failed/."""
+        """处理失败任务: 重试次数未达上限则重新排队，否则移到 failed/.
+
+        使用 tempfile + os.replace() 原子写入模式，确保崩溃时不会丢失任务数据。
+        """
         new_retries = task.retries + 1
 
         if new_retries < self._config.max_retries:
@@ -92,13 +107,12 @@ class TaskQueue:
                 f"<!-- Error: {error} -->\n"
             )
             content = fail_header + content
-            # 先删除 .running 文件，再写入 .md（避免崩溃时两个文件同时存在）
+            dest = self._task_dir / f"{task.name}.md"
+            _atomic_write(dest, content)
             try:
                 task.path.unlink()
             except OSError:
                 pass
-            restored = self._task_dir / f"{task.name}.md"
-            restored.write_text(content, encoding="utf-8")
             logger.info(
                 "任务 %s 将重试 (%d/%d)",
                 task.name,
@@ -115,12 +129,11 @@ class TaskQueue:
                 f"<!-- Retries exhausted: {new_retries}/{self._config.max_retries} -->\n"
             )
             content = fail_header + task.content
-            # 先删除 .running 文件，再写入目标文件
+            _atomic_write(dest, content)
             try:
                 task.path.unlink()
             except OSError:
                 pass
-            dest.write_text(content, encoding="utf-8")
             logger.info(
                 "任务 %s 重试次数耗尽，已移至 failed/: %s",
                 task.name,
@@ -154,6 +167,24 @@ class TaskQueue:
             except OSError as e:
                 logger.error("恢复失败: %s: %s", running_file.name, e)
         return count
+
+
+_MAX_TASK_FILE_SIZE = 1024 * 1024  # 1 MB
+
+
+def _atomic_write(dest: Path, content: str) -> None:
+    """原子写入文件: 先写到临时文件，再 os.replace() 到目标路径."""
+    fd, tmp_path = tempfile.mkstemp(dir=str(dest.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, str(dest))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _extract_retry_count(content: str) -> int:

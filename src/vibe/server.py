@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +23,8 @@ logger = logging.getLogger(__name__)
 # 全局日志缓冲（供 SSE 推送），存储 (seq, msg) 元组
 _log_seq = itertools.count()
 _log_buffer: deque[tuple[int, str]] = deque(maxlen=500)
-_log_event = asyncio.Event()
+_log_event: asyncio.Event | None = None
+_loop: asyncio.AbstractEventLoop | None = None
 
 
 class _SSELogHandler(logging.Handler):
@@ -31,10 +33,10 @@ class _SSELogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         msg = self.format(record)
         _log_buffer.append((next(_log_seq), msg))
-        try:
-            _log_event.set()
-        except RuntimeError:
-            pass
+        loop = _loop
+        event = _log_event
+        if loop is not None and event is not None:
+            loop.call_soon_threadsafe(event.set)
 
 
 def _install_log_handler() -> None:
@@ -55,10 +57,20 @@ def create_app(
     workspace = Path(config.workspace).resolve()
     config.workspace = str(workspace)
 
-    app = FastAPI(title="Vibe Manager", version="0.2.0")
     _task_num_lock = threading.Lock()
 
     _install_log_handler()
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI):
+        global _loop, _log_event
+        _loop = asyncio.get_running_loop()
+        _log_event = asyncio.Event()
+        yield
+        _loop = None
+        _log_event = None
+
+    app = FastAPI(title="Vibe Manager", version="0.2.0", lifespan=_lifespan)
 
     # ── 任务列表 ─────────────────────────────────────────────
 
@@ -205,9 +217,13 @@ def create_app(
                 yield f"data: {msg}\n\n"
                 last_seq = seq
             while True:
-                _log_event.clear()
+                event = _log_event
+                if event is None:
+                    await asyncio.sleep(1)
+                    continue
+                event.clear()
                 try:
-                    await asyncio.wait_for(_log_event.wait(), timeout=15)
+                    await asyncio.wait_for(event.wait(), timeout=15)
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
                     continue
@@ -254,9 +270,14 @@ def create_app(
     # ── HTML Dashboard ────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard() -> str:
+    async def dashboard() -> HTMLResponse:
         html_path = Path(__file__).parent / "dashboard.html"
-        return html_path.read_text(encoding="utf-8")
+        if not html_path.is_file():
+            return HTMLResponse(
+                "<h1>Dashboard not found</h1><p>dashboard.html is missing.</p>",
+                status_code=500,
+            )
+        return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
     return app
 

@@ -1,9 +1,10 @@
 """测试 task.py — 全部用 tmp_path 做真实文件操作."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe.config import Config
-from vibe.task import TaskQueue, _extract_retry_count, _set_retry_count
+from vibe.task import TaskQueue, _extract_retry_count, _set_retry_count, _MAX_TASK_FILE_SIZE
 
 
 # ── retry count 辅助函数 ─────────────────────────────────────
@@ -96,6 +97,55 @@ class TestFail:
         # 移到 failed/
         failed_files = list((workspace / "tasks" / "failed").glob("*.md"))
         assert len(failed_files) == 1
+
+
+class TestFailAtomicWrite:
+    """测试 fail() 的原子写入: os.replace 失败时 .running 文件不丢失."""
+
+    def test_retry_atomic_preserves_running_on_replace_failure(
+        self, queue: TaskQueue, workspace: Path,
+    ):
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+        task = queue.claim_next("w0")
+        assert task is not None
+
+        with patch("vibe.task.os.replace", side_effect=OSError("disk full")):
+            try:
+                queue.fail(task, "some error")
+            except OSError:
+                pass
+
+        # .running 文件应当仍然存在（未被删除）
+        assert task.path.exists()
+
+    def test_exhausted_atomic_preserves_running_on_replace_failure(
+        self, workspace: Path,
+    ):
+        cfg = Config(workspace=str(workspace), max_retries=1)
+        q = TaskQueue(cfg, workspace)
+
+        task_file = workspace / "tasks" / "001_test.md"
+        task_file.write_text("<!-- RETRY: 0 -->\ntask", encoding="utf-8")
+        task = q.claim_next("w0")
+        assert task is not None
+
+        with patch("vibe.task.os.replace", side_effect=OSError("disk full")):
+            try:
+                q.fail(task, "final error")
+            except OSError:
+                pass
+
+        # .running 文件应当仍然存在
+        assert task.path.exists()
+
+
+class TestFileSizeLimit:
+    def test_oversized_file_skipped(self, queue: TaskQueue, workspace: Path):
+        task_file = workspace / "tasks" / "001_big.md"
+        # 写入超过 1MB 的内容
+        task_file.write_text("x" * (_MAX_TASK_FILE_SIZE + 1), encoding="utf-8")
+        task = queue.claim_next("w0")
+        assert task is None
 
 
 class TestRecover:

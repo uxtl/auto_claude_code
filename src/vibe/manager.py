@@ -263,7 +263,11 @@ def _run_claude(
         proc.kill()
         proc.wait()
         stdout_thread.join(timeout=5)
+        if stdout_thread.is_alive():
+            logger.warning("stdout 读取线程在 join 超时后仍在运行")
         stderr_thread.join(timeout=5)
+        if stderr_thread.is_alive():
+            logger.warning("stderr 读取线程在 join 超时后仍在运行")
         return TaskResult(
             success=False,
             error=f"执行超时（{timeout} 秒）",
@@ -274,7 +278,11 @@ def _run_claude(
 
     duration = time.monotonic() - start_time
     stdout_thread.join(timeout=10)
+    if stdout_thread.is_alive():
+        logger.warning("stdout 读取线程在 join 超时后仍在运行")
     stderr_thread.join(timeout=10)
+    if stderr_thread.is_alive():
+        logger.warning("stderr 读取线程在 join 超时后仍在运行")
 
     stderr_text = "\n".join(stderr_lines)
     if proc.returncode != 0:

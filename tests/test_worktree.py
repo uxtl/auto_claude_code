@@ -68,13 +68,14 @@ class TestCommitAndMerge:
         assert result is True
 
     def test_success(self, tmp_path: Path):
-        """status→add→commit→branch→merge 全链路."""
+        """status→add→commit→branch→merge→branch -d 全链路."""
         responses = [
             _cp(stdout="M file.py"),     # status --porcelain
             _cp(),                        # add -A
             _cp(),                        # commit
             _cp(stdout="vibe/w0-123"),   # rev-parse branch
             _cp(),                        # merge
+            _cp(),                        # branch -d
         ]
         with patch("vibe.worktree._run_git", side_effect=responses):
             result = commit_and_merge(tmp_path, Path("/tmp/wt"), "msg")

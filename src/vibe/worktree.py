@@ -38,7 +38,9 @@ def create_worktree(workspace: Path, worker_id: str) -> Path:
     timestamp = int(time.time())
     uid = uuid.uuid4().hex[:6]
     wt_name = f"vibe-{worker_id}-{timestamp}-{uid}"
-    wt_path = Path(f"/tmp/{wt_name}")
+    wt_dir = workspace / ".vibe-worktrees"
+    wt_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_dir / wt_name
 
     # 创建 detached worktree（基于 HEAD）
     branch_name = f"vibe/{worker_id}-{timestamp}-{uid}"
@@ -113,6 +115,12 @@ def commit_and_merge(
         return False
 
     logger.info("已合并分支 %s 到主分支", branch)
+    # 删除已合并的分支，防止 vibe/* 分支堆积
+    del_result = _run_git(["branch", "-d", branch], workspace)
+    if del_result.returncode != 0:
+        logger.warning("删除已合并分支 %s 失败: %s", branch, del_result.stderr.strip())
+    else:
+        logger.debug("已删除已合并分支: %s", branch)
     return True
 
 
