@@ -187,10 +187,56 @@ VIBE_LOG_LEVEL=DEBUG
 
 ## Plan Mode 与人工审批
 
-Plan Mode 将任务执行分为两个阶段：
+Plan Mode 将任务执行分为两个阶段，确保 Claude Code 在执行实际修改前先产出可审查的计划：
 
-1. **生成计划** — 不带写权限调用 Claude Code，只产出执行方案
-2. **执行计划** — 带权限按计划执行实际修改
+### 两阶段执行原理
+
+```
+任务内容
+  ↓
+Phase 1: generate_plan()
+  claude -p "请为以下任务生成执行计划..." --output-format stream-json --verbose
+  （不带 --dangerously-skip-permissions，Claude Code 无法修改文件）
+  ↓
+计划文本
+  ↓
+[审批门控] ← auto_approve=true 时跳过
+  ↓
+Phase 2: execute_plan()
+  claude -p "请严格按照以下计划执行..." --dangerously-skip-permissions --output-format stream-json --verbose
+  （带 --dangerously-skip-permissions，Claude Code 可以自由修改文件）
+  ↓
+执行结果
+```
+
+**核心安全机制**：Phase 1 不带 `--dangerously-skip-permissions` 标志，Claude Code 在此阶段无法执行任何文件写入、命令执行等危险操作，只能产出纯文本计划。Phase 2 带权限执行，但严格按照已审批的计划内容操作。
+
+### 超时预算分配
+
+总超时时间（`timeout`，默认 600s）在两个阶段间分配：
+
+| 阶段 | 超时计算 | 默认值（timeout=600s） |
+|------|----------|----------------------|
+| Phase 1（生成计划） | `min(timeout // 3, 300)` | 200s |
+| 审批等待 | `timeout - Phase1耗时`（下限 60s） | 剩余时间 |
+| Phase 2（执行计划） | `timeout - 已耗时`（下限 60s） | 剩余时间 |
+
+- Phase 1 最多使用总超时的 1/3，且上限为 300 秒
+- 审批等待和 Phase 2 共享剩余时间
+- 任何阶段的剩余时间不足 60 秒时，自动保底为 60 秒
+
+### 错误场景处理
+
+| 场景 | 处理方式 |
+|------|----------|
+| 计划生成失败（Phase 1 退出码非零） | 任务标记为失败，错误信息包含 `计划生成失败（退出码 N: ...）` |
+| 计划生成超时（Phase 1 超时） | 任务标记为失败，错误信息为 `计划生成超时（N 秒）` |
+| 用户拒绝计划（点击 Reject） | 任务标记为失败，错误信息为 `用户拒绝计划` |
+| 审批等待超时（无人操作） | 任务标记为失败，错误信息为 `审批等待超时` |
+| 计划执行失败（Phase 2 退出码非零） | 任务标记为失败，按正常重试机制处理 |
+| 计划执行超时（Phase 2 超时） | 进程被 kill，任务标记为失败 |
+
+所有失败场景都遵循标准重试机制：失败次数未达 `max_retries` 时重新入队，超限后移入 `tasks/failed/`。
 
 ### 自动审批（默认）
 
@@ -198,7 +244,7 @@ Plan Mode 将任务执行分为两个阶段：
 uv run python -m vibe run -w /path/to/project --plan-mode
 ```
 
-生成计划后自动进入执行阶段，无需人工干预。
+生成计划后自动进入执行阶段，无需人工干预。适用于 CI/CD 或信任度较高的场景。
 
 ### 人工审批
 
@@ -216,13 +262,21 @@ uv run python -m vibe serve -w /path/to/project
 ```
 
 工作流程：
-1. Worker 认领任务，调用 Claude Code 生成执行计划
-2. 计划提交到审批队列，Worker 阻塞等待
-3. Web 仪表盘显示待审批计划（含完整计划文本）
+1. Worker 认领任务，调用 Claude Code 生成执行计划（Phase 1）
+2. 计划通过 `ApprovalStore` 提交到审批队列，Worker 线程阻塞在 `threading.Event.wait()` 上
+3. Web 仪表盘每 3 秒轮询 `/api/approvals`，显示待审批计划（含完整计划文本）
 4. 人工点击 **Approve**（批准执行）或 **Reject**（拒绝，标记任务失败）
-5. Worker 收到通知，继续执行或标记失败
+5. 审批结果触发 `threading.Event.set()`，Worker 线程被唤醒，继续执行或标记失败
 
-> **注意**: CLI 模式（`run` 子命令）不支持人工审批（无 Web UI），会自动覆盖为 `plan_auto_approve=true` 并输出警告。
+### CLI 模式 vs Serve 模式
+
+| 特性 | `run`（CLI） | `serve`（Web） |
+|------|-------------|---------------|
+| 人工审批 | 不支持（自动覆盖为 auto_approve=true） | 支持 |
+| 自动审批 | 支持 | 支持 |
+| 原因 | CLI 模式没有 Web 服务器，无法提供审批界面 | 有 Web UI 可交互 |
+
+> **注意**: 如果在 `.env` 中设置了 `VIBE_PLAN_AUTO_APPROVE=false` 但使用 `run` 子命令，框架会自动覆盖为 `true` 并输出警告信息。
 
 ## 任务生命周期
 
@@ -241,6 +295,13 @@ tasks/failed/20260219_143500_001_feature.md ← failed
 ## Docker 隔离模式
 
 启用 Docker 隔离后，每次 Claude Code 调用都会自动包装在 `docker run` 容器内执行，将破坏范围限制在容器内部。
+
+### 前置条件
+
+- **Docker 已安装**：`docker` 命令可用
+- **守护进程运行中**：`docker info` 能正常返回
+- **用户权限**：当前用户在 `docker` 组中（或使用 `sudo`），否则 `docker run` 会权限拒绝
+- **`ANTHROPIC_API_KEY` 环境变量**：必须在宿主机上设置，框架通过 `-e ANTHROPIC_API_KEY` 传递到容器内
 
 ### 使用方式
 
@@ -266,18 +327,213 @@ VIBE_DOCKER_IMAGE=auto-claude-code
 VIBE_DOCKER_EXTRA_ARGS=--network=none --memory=4g
 ```
 
-### 工作原理
+### 启动检查流程
 
-- 每次 `claude` 命令调用被包装为 `docker run --rm -i -v {cwd}:/workspace -w /workspace -e ANTHROPIC_API_KEY {image} claude ...`
-- 工作目录通过 `-v` 挂载到容器的 `/workspace`
-- `ANTHROPIC_API_KEY` 自动传递到容器内
-- 启动时自动检查 Docker 可用性和镜像是否存在（不存在则自动构建）
+框架在 `run_loop()` 启动时自动执行两步检查：
+
+1. **`check_docker_available()`** — 运行 `docker info` 验证 Docker 守护进程可用。如果 `docker` 命令未找到、执行超时（10s）、或返回非零退出码，框架将抛出 `RuntimeError` 并中止启动。
+2. **`ensure_docker_image(image)`** — 运行 `docker image inspect {image}` 检查镜像是否存在。如果镜像不存在且工作目录中存在 `Dockerfile`，则自动执行 `docker build -t {image} .`（超时 600s）。构建成功后继续，失败则中止。
+
+```
+启动 → check_docker_available() → 失败 → RuntimeError（中止）
+                ↓ 成功
+       ensure_docker_image() → 镜像已存在 → 继续
+                ↓ 镜像不存在
+           有 Dockerfile? → 自动 docker build → 成功 → 继续
+                ↓ 无                              ↓ 失败
+           RuntimeError（中止）              RuntimeError（中止）
+```
+
+### 容器执行细节
+
+每次 Claude Code 调用都会创建一个新的容器，完整的 `docker run` 命令如下：
+
+```bash
+docker run --rm -i \
+  -v /path/to/project:/workspace \
+  -w /workspace \
+  -e ANTHROPIC_API_KEY \
+  [docker_extra_args...] \
+  auto-claude-code \
+  claude -p "..." --dangerously-skip-permissions --output-format stream-json --verbose
+```
+
+关键机制：
+- **`--rm`**：容器执行完毕后自动删除，不留残余
+- **`-i`**：保持 stdin 打开，支持 stream-json 输出流读取
+- **`-v {cwd}:/workspace`**：将宿主机的工作目录（worktree 路径或 workspace 路径）挂载到容器的 `/workspace`
+- **`-w /workspace`**：设置容器内工作目录
+- **`-e ANTHROPIC_API_KEY`**：将宿主机的 API Key 环境变量传递到容器内（不是值拷贝，是环境变量透传）
+- **每次执行创建新容器**：容器之间无状态共享，完全隔离
+
+### `docker_extra_args` 使用场景
+
+通过 `VIBE_DOCKER_EXTRA_ARGS` 可以传递额外的 `docker run` 参数，常见场景：
+
+```bash
+# 网络隔离 — 禁止容器访问网络（最安全，但 Claude Code 需要网络调用 API）
+VIBE_DOCKER_EXTRA_ARGS="--network=none"
+
+# 内存限制 — 防止容器耗尽宿主机内存
+VIBE_DOCKER_EXTRA_ARGS="--memory=4g --memory-swap=4g"
+
+# 用户映射 — 避免容器内文件归 root 所有
+VIBE_DOCKER_EXTRA_ARGS="--user $(id -u):$(id -g)"
+
+# 组合使用
+VIBE_DOCKER_EXTRA_ARGS="--memory=4g --user $(id -u):$(id -g)"
+```
+
+> **注意**：Claude Code 需要访问 Anthropic API，如果使用 `--network=none` 会导致 API 调用失败。如需网络限制，建议使用自定义网络策略仅允许访问 API 域名。
+
+### Docker + worktree 组合
+
+当同时启用 Docker 和多 worker worktree 模式时：
+- 每个 worker 的 worktree 路径会被独立挂载到对应容器的 `/workspace`
+- 容器内的 git 操作可能受限，因为 worktree 依赖的父 `.git` 目录不在容器挂载范围内
+- 建议在 Docker 模式下使用 `--no-worktree` 或单 worker 避免此问题
+
+### Docker + Plan Mode 组合
+
+两者可以叠加使用。Plan Mode 的两个阶段都会在 Docker 容器内执行：
+- Phase 1（生成计划）：在容器内运行，无 `--dangerously-skip-permissions`
+- Phase 2（执行计划）：在新容器内运行，带 `--dangerously-skip-permissions`
+- 每个阶段创建独立的容器，互不影响
+
+```bash
+uv run python -m vibe run -w /path/to/project --docker --plan-mode
+```
 
 ### 已知限制
 
 - 容器内创建的文件归 root 所有，可通过 `VIBE_DOCKER_EXTRA_ARGS="--user $(id -u):$(id -g)"` 解决
 - Git worktree + Docker 模式下，容器内 git 操作可能因无法访问父 `.git` 目录而受限
 - 框架自身运行在 Docker 内时（docker-compose 场景）不应再启用 `use_docker`（避免 Docker-in-Docker）
+
+## Web 仪表盘详解
+
+`serve` 模式提供一个单页 Web 仪表盘，用于任务管理、实时日志查看和 Plan Mode 审批。
+
+### 启动方式
+
+```bash
+uv run python -m vibe serve -w /path/to/project --port 8080
+```
+
+打开 `http://localhost:8080` 访问仪表盘。`serve` 模式同时在后台线程运行任务循环（`run_loop`），无需单独启动 `run`。
+
+### 功能总览
+
+- **任务管理**：查看所有任务状态（pending / running / done / failed），添加新任务，删除任务，重试失败任务
+- **实时日志**：通过 SSE（Server-Sent Events）推送实时日志流到浏览器
+- **审批门控**：Plan Mode 下展示待审批的执行计划，支持一键批准或拒绝
+
+### API 端点
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/` | HTML 仪表盘页面（单文件 `dashboard.html`） |
+| `GET` | `/api/tasks` | 获取所有任务列表（含状态、文件名、worker 信息） |
+| `POST` | `/api/tasks` | 添加新任务，Body: `{"description": "任务描述"}` |
+| `DELETE` | `/api/tasks/{name}` | 删除任务（匹配 pending 或 failed 目录） |
+| `POST` | `/api/tasks/{name}/retry` | 重试指定失败任务（清除重试计数，移回任务队列） |
+| `GET` | `/api/config` | 获取当前运行配置 |
+| `GET` | `/api/logs` | SSE 日志流端点 |
+| `GET` | `/api/approvals` | 获取待审批计划列表 |
+| `POST` | `/api/approvals/{id}/approve` | 批准指定计划 |
+| `POST` | `/api/approvals/{id}/reject` | 拒绝指定计划 |
+
+### SSE 实时日志流
+
+连接 `/api/logs` 端点即可接收实时日志推送：
+
+```javascript
+const es = new EventSource("/api/logs");
+es.onmessage = (e) => console.log(e.data);
+```
+
+实现细节：
+- **环形缓冲区**：内存中保留最近 500 条日志（`deque(maxlen=500)`）
+- **序列号去重**：每条日志带递增序列号，客户端只接收 `seq > last_seq` 的新日志
+- **历史回放**：新连接时先发送缓冲区中的所有已有日志，再进入实时推送
+- **心跳保活**：15 秒无新日志时发送 SSE 注释 `: keepalive`，防止连接超时断开
+- **线程安全**：日志从 worker 线程写入缓冲区，通过 `asyncio.loop.call_soon_threadsafe()` 通知异步事件循环
+
+### 审批卡片
+
+当 Plan Mode 启用且 `plan_auto_approve=false` 时，仪表盘显示审批卡片：
+
+- **展示内容**：审批 ID、任务名、Worker ID、完整计划文本、创建时间
+- **操作按钮**：Approve（批准执行）/ Reject（拒绝，任务标记失败）
+- **刷新频率**：前端每 3 秒轮询 `/api/approvals` 获取最新待审批列表
+- **审批存储**：`ApprovalStore` 使用 `threading.Lock` 保证线程安全，`threading.Event` 实现 Worker 阻塞等待
+
+### 任务列表轮询
+
+前端每 5 秒轮询 `/api/tasks` 刷新任务状态显示，包括：
+- 各状态任务数量统计
+- 正在执行的任务所属 Worker
+- 已完成和失败任务的时间戳
+
+## 常见使用场景
+
+### 场景一：快速测试（单 Worker + 自动审批）
+
+最简配置，适合开发调试和快速验证：
+
+```env
+# .env
+VIBE_MAX_WORKERS=1
+VIBE_TIMEOUT=600
+VIBE_PLAN_MODE=false
+```
+
+```bash
+uv run python -m vibe run -w /path/to/project
+```
+
+### 场景二：生产安全（多 Worker + 手动审批 + Worktree 隔离）
+
+多任务并行执行，通过 Plan Mode 和人工审批确保安全：
+
+```env
+# .env
+VIBE_MAX_WORKERS=3
+VIBE_TIMEOUT=900
+VIBE_USE_WORKTREE=true
+VIBE_PLAN_MODE=true
+VIBE_PLAN_AUTO_APPROVE=false
+VIBE_LOG_LEVEL=DEBUG
+VIBE_LOG_FILE=vibe.log
+```
+
+```bash
+uv run python -m vibe serve -w /path/to/project --port 8080
+```
+
+每个任务先生成计划，在 Web 仪表盘审批后才执行。3 个 Worker 各自使用独立 worktree，互不干扰。
+
+### 场景三：最大隔离（Docker + Plan Mode + 手动审批）
+
+最高安全级别，Claude Code 在容器内运行，且需人工审批：
+
+```env
+# .env
+VIBE_MAX_WORKERS=2
+VIBE_TIMEOUT=900
+VIBE_USE_DOCKER=true
+VIBE_DOCKER_IMAGE=auto-claude-code
+VIBE_DOCKER_EXTRA_ARGS=--memory=4g --user 1000:1000
+VIBE_USE_WORKTREE=false
+VIBE_PLAN_MODE=true
+VIBE_PLAN_AUTO_APPROVE=false
+```
+
+```bash
+uv run python -m vibe serve -w /path/to/project --port 8080
+```
+
+每次 Claude Code 调用都在独立 Docker 容器中执行，文件修改通过 volume 挂载同步回宿主机。结合 Plan Mode 审批，双重保障。
 
 ## Docker 部署
 
