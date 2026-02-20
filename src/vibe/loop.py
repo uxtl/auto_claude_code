@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import atexit
 import logging
-import shutil
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -23,27 +22,6 @@ from .worktree import (
 )
 
 logger = logging.getLogger(__name__)
-
-# 内置模板目录
-_TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-
-
-def deploy_templates(workspace: Path) -> None:
-    """将 CLAUDE.md 和 PROGRESS.md 模板部署到目标 workspace.
-
-    仅在目标文件不存在时复制，不会覆盖用户已有的文件。
-    """
-    for name in ("CLAUDE.md", "PROGRESS.md"):
-        dest = workspace / name
-        if dest.exists():
-            logger.debug("模板 %s 已存在，跳过", dest)
-            continue
-        src = _TEMPLATES_DIR / name
-        if not src.is_file():
-            logger.warning("内置模板 %s 不存在", src)
-            continue
-        shutil.copy2(src, dest)
-        logger.info("已部署模板: %s → %s", name, dest)
 
 
 def run_loop(
@@ -86,9 +64,6 @@ def run_loop(
             signal.signal(sig, _signal_handler)
         except (OSError, ValueError):
             pass  # 非主线程中无法注册信号处理器
-
-    # 部署模板文件到 workspace（不覆盖已有文件）
-    deploy_templates(workspace)
 
     task_dir = workspace / config.task_dir
 
