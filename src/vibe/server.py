@@ -266,7 +266,8 @@ def start_server(config: Config, host: str = "0.0.0.0", port: int = 8080) -> Non
 
     # 后台线程运行任务循环
     loop_thread = threading.Thread(
-        target=run_loop, args=(config,), kwargs={"approval_store": store},
+        target=run_loop, args=(config,),
+        kwargs={"approval_store": store, "continuous": True},
         daemon=True, name="vibe-loop",
     )
     loop_thread.start()

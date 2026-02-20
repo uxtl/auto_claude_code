@@ -24,11 +24,20 @@ from .worktree import (
 logger = logging.getLogger(__name__)
 
 
-def run_loop(config: Config, approval_store: ApprovalStore | None = None) -> None:
+def run_loop(
+    config: Config,
+    approval_store: ApprovalStore | None = None,
+    *,
+    continuous: bool = False,
+) -> None:
     """主调度循环: 创建任务队列，启动 worker.
 
     当 max_workers > 1 且 workspace 是 git 仓库时，为每个 worker 创建独立的
     git worktree 实现文件系统隔离。
+
+    Args:
+        continuous: 若为 True，处理完当前批次后不退出，等待 poll_interval 秒
+                    后重新扫描新任务。适用于 serve 模式下持续运行。
     """
     workspace = Path(config.workspace).resolve()
     config.workspace = str(workspace)
@@ -69,42 +78,63 @@ def run_loop(config: Config, approval_store: ApprovalStore | None = None) -> Non
     logger.info("Vibe Loop 启动，工作目录: %s", workspace)
     logger.info("任务目录: %s", task_dir)
     logger.info("Worker 数量: %d", config.max_workers)
+    if continuous:
+        logger.info("持续轮询模式已启用，间隔: %d 秒", config.poll_interval)
 
     queue = TaskQueue(config, workspace)
 
-    # 检查是否有待执行任务
-    pending = sorted(task_dir.glob("*.md"))
-    if not pending:
-        logger.info("没有待执行的任务，退出")
-        return
+    while True:
+        # 检查是否收到关闭信号
+        if shutdown_event.is_set():
+            break
 
-    logger.info("发现 %d 个待执行任务", len(pending))
+        # 检查是否有待执行任务
+        pending = sorted(task_dir.glob("*.md"))
+        if not pending:
+            if not continuous:
+                logger.info("没有待执行的任务，退出")
+                return
+            # continuous 模式: 等待后重新扫描
+            if shutdown_event.wait(timeout=config.poll_interval):
+                break  # 收到关闭信号
+            continue
 
-    use_wt = (
-        config.max_workers > 1
-        and config.use_worktree
-        and is_git_repo(workspace)
-    )
+        logger.info("发现 %d 个待执行任务", len(pending))
 
-    if use_wt:
-        logger.info("Git worktree 模式启用，为每个 worker 创建隔离工作树")
-        cleanup_stale_worktrees(workspace)
-    elif config.max_workers > 1 and config.use_worktree and not is_git_repo(workspace):
-        logger.warning(
-            "工作目录不是 git 仓库，无法使用 worktree 隔离。"
-            "多 worker 将共享同一目录，可能产生冲突！"
+        use_wt = (
+            config.max_workers > 1
+            and config.use_worktree
+            and is_git_repo(workspace)
         )
 
-    if config.max_workers == 1:
-        # 单 worker 快速路径，无线程开销，无需 worktree
-        worker_loop("w0", config, queue, approval_store=approval_store)
-    elif use_wt:
-        _run_with_worktrees(config, queue, workspace, approval_store=approval_store)
-    else:
-        _run_shared(config, queue, approval_store=approval_store)
+        if use_wt:
+            logger.info("Git worktree 模式启用，为每个 worker 创建隔离工作树")
+            cleanup_stale_worktrees(workspace)
+        elif config.max_workers > 1 and config.use_worktree and not is_git_repo(workspace):
+            logger.warning(
+                "工作目录不是 git 仓库，无法使用 worktree 隔离。"
+                "多 worker 将共享同一目录，可能产生冲突！"
+            )
 
-    logger.info("=" * 60)
-    logger.info("Vibe Loop 完成，所有任务已处理")
+        if config.max_workers == 1:
+            # 单 worker 快速路径，无线程开销，无需 worktree
+            worker_loop("w0", config, queue, approval_store=approval_store)
+        elif use_wt:
+            _run_with_worktrees(config, queue, workspace, approval_store=approval_store)
+        else:
+            _run_shared(config, queue, approval_store=approval_store)
+
+        logger.info("=" * 60)
+        logger.info("Vibe Loop 完成，所有任务已处理")
+
+        if not continuous:
+            return
+
+        # continuous 模式: 等待后重新扫描
+        if shutdown_event.wait(timeout=config.poll_interval):
+            break  # 收到关闭信号
+
+    logger.info("Vibe Loop 收到关闭信号，退出")
 
 
 def _run_with_worktrees(

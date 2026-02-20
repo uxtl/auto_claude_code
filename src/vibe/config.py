@@ -31,6 +31,7 @@ class Config:
     use_docker: bool = False
     docker_image: str = "auto-claude-code"
     docker_extra_args: str = ""
+    poll_interval: int = 30
 
 
 _ENV_PREFIX = "VIBE_"

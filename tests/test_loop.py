@@ -1,5 +1,6 @@
 """测试 loop.py — mock worker + worktree 函数."""
 
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -7,6 +8,7 @@ import pytest
 
 from vibe.config import Config
 from vibe.loop import run_loop
+from vibe.worker import shutdown_event
 
 
 class TestRunLoop:
@@ -131,3 +133,93 @@ class TestDockerPreCheck:
         ):
             run_loop(config)
         mock_check.assert_not_called()
+
+
+class TestContinuousMode:
+    """测试 continuous=True 持续轮询模式."""
+
+    def setup_method(self):
+        shutdown_event.clear()
+
+    def teardown_method(self):
+        shutdown_event.clear()
+
+    def test_continuous_false_no_tasks_exits(self, config: Config, workspace: Path):
+        """continuous=False + 无任务 → 立即退出（现有行为不变）."""
+        with patch("vibe.loop.worker_loop") as mock_wl:
+            run_loop(config, continuous=False)
+        mock_wl.assert_not_called()
+
+    def test_continuous_true_no_tasks_waits_then_exits(self, workspace: Path):
+        """continuous=True + 无任务 → 等待轮询，shutdown_event 后退出."""
+        cfg = Config(workspace=str(workspace), poll_interval=1)
+
+        # 在短延迟后触发 shutdown_event
+        def _set_shutdown():
+            shutdown_event.set()
+
+        timer = threading.Timer(0.3, _set_shutdown)
+        timer.start()
+
+        with patch("vibe.loop.worker_loop") as mock_wl:
+            run_loop(cfg, continuous=True)
+
+        mock_wl.assert_not_called()
+
+    def test_continuous_true_processes_then_polls(self, workspace: Path):
+        """continuous=True + 有任务 → 处理完后继续轮询，直到 shutdown."""
+        cfg = Config(workspace=str(workspace), poll_interval=1)
+        task_file = workspace / "tasks" / "001_test.md"
+        task_file.write_text("task", encoding="utf-8")
+
+        call_count = 0
+
+        def mock_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # worker 处理完任务后，删除文件模拟任务完成
+            if task_file.exists():
+                task_file.unlink()
+
+        # 在 worker 执行后短延迟触发 shutdown
+        def _set_shutdown():
+            shutdown_event.set()
+
+        timer = threading.Timer(0.5, _set_shutdown)
+        timer.start()
+
+        with patch("vibe.loop.worker_loop", side_effect=mock_worker):
+            run_loop(cfg, continuous=True)
+
+        assert call_count == 1
+
+    def test_continuous_true_picks_up_new_tasks(self, workspace: Path):
+        """continuous=True → 第一轮无任务，第二轮有新任务 → 执行新任务."""
+        cfg = Config(workspace=str(workspace), poll_interval=1)
+        task_dir = workspace / "tasks"
+
+        worker_called = threading.Event()
+
+        def mock_worker(*args, **kwargs):
+            # 删除任务文件模拟完成
+            for f in task_dir.glob("*.md"):
+                f.unlink()
+            worker_called.set()
+
+        # 延迟添加任务
+        def _add_task():
+            (task_dir / "001_new.md").write_text("new task", encoding="utf-8")
+
+        def _set_shutdown():
+            shutdown_event.set()
+
+        # 0.3s 后添加新任务，1.5s 后关闭
+        timer_add = threading.Timer(0.3, _add_task)
+        timer_shutdown = threading.Timer(2.5, _set_shutdown)
+        timer_add.start()
+        timer_shutdown.start()
+
+        with patch("vibe.loop.worker_loop", side_effect=mock_worker):
+            run_loop(cfg, continuous=True)
+
+        assert worker_called.is_set()

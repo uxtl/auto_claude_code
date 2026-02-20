@@ -106,3 +106,19 @@ class TestLoadConfig:
         cfg = load_config(workspace=tmp_path)
         assert cfg.use_docker is True
         assert cfg.docker_image == "custom"
+
+    def test_poll_interval_default(self, tmp_path: Path):
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.poll_interval == 30
+
+    def test_poll_interval_env_override(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("VIBE_POLL_INTERVAL", "10")
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.poll_interval == 10
+
+    def test_poll_interval_dotenv(self, tmp_path: Path):
+        (tmp_path / ".env").write_text(
+            "VIBE_POLL_INTERVAL=15\n", encoding="utf-8"
+        )
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.poll_interval == 15
