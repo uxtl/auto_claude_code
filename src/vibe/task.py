@@ -21,6 +21,7 @@ _COMMENT_PREFIXES = (
     "<!-- FINAL FAILURE",
     "<!-- Error:",
     "<!-- Retries exhausted",
+    "<!-- Diagnostics:",
 )
 
 
@@ -110,12 +111,17 @@ class TaskQueue:
         except OSError as e:
             logger.error("归档任务 %s 失败: %s", task.name, e)
 
-    def fail(self, task: Task, error: str) -> None:
+    def fail(self, task: Task, error: str, diagnostics: str = "") -> None:
         """处理失败任务: 重试次数未达上限则重新排队，否则移到 failed/.
 
         使用 tempfile + os.replace() 原子写入模式，确保崩溃时不会丢失任务数据。
+        diagnostics 非空时追加多行 HTML 注释块。
         """
         new_retries = task.retries + 1
+
+        diag_block = ""
+        if diagnostics:
+            diag_block = f"<!-- Diagnostics:\n{diagnostics}\n-->\n"
 
         if new_retries < self._config.max_retries:
             # 更新重试计数，改名回 .md 重新排队
@@ -124,7 +130,7 @@ class TaskQueue:
                 f"<!-- FAILED at {datetime.now().isoformat()} -->\n"
                 f"<!-- Error: {error} -->\n"
             )
-            content = fail_header + content
+            content = fail_header + diag_block + content
             dest = self._task_dir / f"{task.name}.md"
             _atomic_write(dest, content)
             try:
@@ -146,7 +152,7 @@ class TaskQueue:
                 f"<!-- Error: {error} -->\n"
                 f"<!-- Retries exhausted: {new_retries}/{self._config.max_retries} -->\n"
             )
-            content = fail_header + task.content
+            content = fail_header + diag_block + task.content
             _atomic_write(dest, content)
             try:
                 task.path.unlink()
@@ -185,7 +191,7 @@ class TaskQueue:
         retried: list[str] = []
         for src in matches:
             content = src.read_text(encoding="utf-8")
-            _, clean_content = extract_error_context(content)
+            _, _, clean_content = extract_error_context(content)
 
             dest_name = _ts_prefix.sub("", src.name)
             dest = task_dir / dest_name
@@ -249,24 +255,54 @@ def _extract_retry_count(content: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def extract_error_context(content: str) -> tuple[list[str], str]:
-    """从任务内容中提取错误上下文，返回 (错误信息列表, 清理后的内容)。
+def extract_error_context(content: str) -> tuple[list[str], list[str], str]:
+    """从任务内容中提取错误上下文，返回 (错误信息列表, 诊断列表, 清理后的内容)。
 
     解析 <!-- FAILED at ... -->, <!-- Error: ... --> 等注释行，
-    提取错误文本，并返回去除这些注释后的干净内容。
+    以及多行 <!-- Diagnostics: ... --> 块，
+    提取错误文本和诊断信息，并返回去除这些注释后的干净内容。
     """
     errors: list[str] = []
+    diagnostics: list[str] = []
     clean_lines: list[str] = []
+    in_diagnostics = False
+    diag_lines: list[str] = []
+
     for line in content.splitlines():
         stripped = line.strip()
+
+        # 多行诊断块状态机
+        if in_diagnostics:
+            if stripped == "-->" or stripped.endswith("-->"):
+                # 诊断块结束
+                diagnostics.append("\n".join(diag_lines))
+                diag_lines = []
+                in_diagnostics = False
+            else:
+                diag_lines.append(line)
+            continue
+
+        if stripped.startswith("<!-- Diagnostics:"):
+            in_diagnostics = True
+            # 同一行可能有内容: <!-- Diagnostics: xxx -->
+            rest = stripped[len("<!-- Diagnostics:"):].strip()
+            if rest.endswith("-->"):
+                # 单行诊断
+                diagnostics.append(rest[:-3].strip())
+                in_diagnostics = False
+            elif rest:
+                diag_lines.append(rest)
+            continue
+
         if any(stripped.startswith(p) for p in _COMMENT_PREFIXES):
             m = _ERROR_PATTERN.search(stripped)
             if m:
                 errors.append(m.group(1))
         else:
             clean_lines.append(line)
+
     clean_content = "\n".join(clean_lines).strip() + "\n" if clean_lines else ""
-    return errors, clean_content
+    return errors, diagnostics, clean_content
 
 
 def _set_retry_count(content: str, count: int) -> str:

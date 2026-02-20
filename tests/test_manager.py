@@ -70,6 +70,29 @@ class TestParseStreamJson:
         result = _parse_stream_json([json.dumps(event)])
         assert "final answer" in result.output
 
+    def test_tool_result_event(self):
+        """tool_result 事件被收集到 tool_results."""
+        event = {
+            "type": "tool_result",
+            "tool_use_id": "tc_123",
+            "content": "file content here",
+        }
+        result = _parse_stream_json([json.dumps(event)])
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0]["tool_use_id"] == "tc_123"
+
+    def test_tool_result_with_error(self):
+        """is_error=True 的 tool_result 也被收集."""
+        event = {
+            "type": "tool_result",
+            "tool_use_id": "tc_456",
+            "is_error": True,
+            "content": "No match found",
+        }
+        result = _parse_stream_json([json.dumps(event)])
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0]["is_error"] is True
+
 
 # ── _read_stream ─────────────────────────────────────────────
 
@@ -319,6 +342,39 @@ class TestRunTask:
             result = run_task("hello", cwd=tmp_path)
         assert result.success is False
         assert result.return_code == 1
+
+    def test_nonzero_exit_still_parses_stream(self, tmp_path):
+        """非零退出码时仍然解析 stream-json 填充 tool_calls."""
+        tool_event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "tc1", "name": "Bash",
+                     "input": {"command": "uv run pytest"}}
+                ]
+            },
+        }
+        tool_result_event = {
+            "type": "tool_result",
+            "tool_use_id": "tc1",
+            "is_error": True,
+            "content": "FAILED tests/test_x.py::test_y",
+        }
+        stdout = (json.dumps(tool_event) + "\n" + json.dumps(tool_result_event) + "\n").encode()
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.BytesIO(stdout)
+        mock_proc.stderr = io.BytesIO(b"error\n")
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 1
+
+        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc):
+            result = run_task("hello", cwd=tmp_path)
+        assert result.success is False
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "Bash"
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0]["is_error"] is True
 
     def test_success(self, tmp_path):
         event = {

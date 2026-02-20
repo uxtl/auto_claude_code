@@ -56,6 +56,26 @@ class TestBuildPrompt:
         assert "<!-- RETRY:" not in result
         assert "do something" in result
 
+    def test_retry_prompt_includes_diagnostics(self):
+        """重试 prompt 包含诊断信息."""
+        content = (
+            "<!-- FAILED at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: broke -->\n"
+            "<!-- Diagnostics:\n"
+            "执行诊断（耗时 45.2s，退出码 1）:\n"
+            "执行摘要: 共 10 次工具调用，3 次失败\n"
+            "-->\n"
+            "<!-- RETRY: 1 -->\n"
+            "do something\n"
+        )
+        task = Task(path=Path("/tmp/fake.md"), name="test", content=content, retries=1)
+        result = build_prompt(task)
+        assert "执行诊断" in result
+        assert "45.2s" in result
+        assert "### 执行诊断" in result
+        assert "do something" in result
+        assert "<!-- Diagnostics" not in result
+
 
 class TestWorkerLoop:
     def test_empty_queue(self, config: Config, queue: TaskQueue):
@@ -116,6 +136,56 @@ class TestExecuteTask:
             worker_loop("w0", cfg, q)
 
         mock_plan.assert_called_once()
+
+
+class TestDiagnosticsInjection:
+    def test_failure_generates_diagnostics(self, workspace: Path):
+        """失败时 analyze_execution 被调用，诊断传给 queue.fail."""
+        cfg = Config(workspace=str(workspace), max_retries=1)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        mock_result = TaskResult(
+            success=False,
+            error="退出码 1: error",
+            return_code=1,
+            duration_seconds=10.0,
+            tool_calls=[
+                {"name": "Bash", "id": "tc1", "input": {"command": "uv run pytest"}},
+            ],
+            tool_results=[
+                {"tool_use_id": "tc1", "is_error": True, "content": "FAILED tests/test_x.py::test_y"},
+            ],
+        )
+        with patch("vibe.worker.manager.run_task", return_value=mock_result):
+            worker_loop("w0", cfg, q)
+
+        # 任务应该到 failed/ 中（max_retries=1, 第一次失败就耗尽）
+        failed_files = list((workspace / "tasks" / "failed").glob("*.md"))
+        assert len(failed_files) == 1
+        content = failed_files[0].read_text(encoding="utf-8")
+        assert "Diagnostics" in content
+        assert "执行诊断" in content
+
+    def test_failure_with_empty_diagnostics(self, workspace: Path):
+        """无 tool_calls 时不生成诊断块."""
+        cfg = Config(workspace=str(workspace), max_retries=1)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        mock_result = TaskResult(
+            success=False,
+            error="退出码 1: error",
+            return_code=1,
+            duration_seconds=5.0,
+        )
+        with patch("vibe.worker.manager.run_task", return_value=mock_result):
+            worker_loop("w0", cfg, q)
+
+        failed_files = list((workspace / "tasks" / "failed").glob("*.md"))
+        assert len(failed_files) == 1
+        content = failed_files[0].read_text(encoding="utf-8")
+        assert "Diagnostics" not in content
 
 
 class TestApprovalFlow:

@@ -25,6 +25,7 @@ class TaskResult:
     error: str = ""
     files_changed: list[str] = field(default_factory=list)
     tool_calls: list[dict] = field(default_factory=list)
+    tool_results: list[dict] = field(default_factory=list)
     duration_seconds: float = 0.0
     return_code: int | None = None
 
@@ -53,6 +54,7 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
     output_parts: list[str] = []
     files_changed: list[str] = []
     tool_calls: list[dict] = []
+    tool_results: list[dict] = []
 
     for line in lines:
         line = line.strip()
@@ -74,6 +76,10 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
                 for block in message.get("content", []):
                     if isinstance(block, dict) and block.get("type") == "text":
                         output_parts.append(block["text"])
+
+        # 提取工具结果
+        if event_type == "tool_result":
+            tool_results.append(event)
 
         # 提取工具调用信息
         if event_type == "tool_use":
@@ -106,6 +112,7 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
         output=output,
         files_changed=files_changed,
         tool_calls=tool_calls,
+        tool_results=tool_results,
     )
 
 
@@ -323,14 +330,12 @@ def _run_claude(
                 proc.wait()
             stdout_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
-            interrupted = True
-            return TaskResult(
-                success=False,
-                error="中断: 收到关闭信号",
-                output="\n".join(stdout_lines),
-                duration_seconds=duration,
-                return_code=proc.returncode,
-            )
+            parsed = _parse_stream_json(stdout_lines)
+            parsed.success = False
+            parsed.error = "中断: 收到关闭信号"
+            parsed.duration_seconds = duration
+            parsed.return_code = proc.returncode
+            return parsed
 
         # 检查超时
         if time.monotonic() >= deadline:
@@ -344,13 +349,12 @@ def _run_claude(
             stderr_thread.join(timeout=5)
             if stderr_thread.is_alive():
                 logger.warning("stderr 读取线程在 join 超时后仍在运行")
-            return TaskResult(
-                success=False,
-                error=f"执行超时（{timeout} 秒）",
-                output="\n".join(stdout_lines),
-                duration_seconds=duration,
-                return_code=None,
-            )
+            parsed = _parse_stream_json(stdout_lines)
+            parsed.success = False
+            parsed.error = f"执行超时（{timeout} 秒）"
+            parsed.duration_seconds = duration
+            parsed.return_code = None
+            return parsed
 
     duration = time.monotonic() - start_time
     stdout_thread.join(timeout=10)
@@ -363,13 +367,12 @@ def _run_claude(
     stderr_text = "\n".join(stderr_lines)
     if proc.returncode != 0:
         logger.error("退出码 %d, stderr: %s", proc.returncode, stderr_text)
-        return TaskResult(
-            success=False,
-            error=f"退出码 {proc.returncode}: {stderr_text}",
-            output="\n".join(stdout_lines),
-            duration_seconds=duration,
-            return_code=proc.returncode,
-        )
+        parsed = _parse_stream_json(stdout_lines)
+        parsed.success = False
+        parsed.error = f"退出码 {proc.returncode}: {stderr_text}"
+        parsed.duration_seconds = duration
+        parsed.return_code = proc.returncode
+        return parsed
 
     # 解析 stream-json 输出
     result = _parse_stream_json(stdout_lines)

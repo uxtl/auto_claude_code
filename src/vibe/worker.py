@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import manager
+from .analyzer import analyze_execution
 from .approval import ApprovalStore
 from .config import Config
 from .manager import TaskResult
@@ -46,17 +47,17 @@ def build_prompt(task: Task | str) -> str:
         return PROMPT_PREFIX + task + PROMPT_SUFFIX
 
     if task.retries > 0:
-        errors, clean_content = extract_error_context(task.content)
-        if errors:
-            error_block = "\n".join(f"- {e}" for e in errors)
-            return (
-                PROMPT_PREFIX
-                + clean_content
-                + f"\n\n## 上次执行失败信息\n\n"
-                f"这是第 {task.retries + 1} 次尝试。之前失败的原因：\n{error_block}\n"
-                f"请特别注意避免同样的错误。\n"
-                + PROMPT_SUFFIX
-            )
+        errors, diagnostics, clean_content = extract_error_context(task.content)
+        if errors or diagnostics:
+            sections = PROMPT_PREFIX + clean_content + "\n\n## 上次执行失败信息\n\n"
+            sections += f"这是第 {task.retries + 1} 次尝试。"
+            if errors:
+                error_block = "\n".join(f"- {e}" for e in errors)
+                sections += f"之前失败的原因：\n{error_block}\n"
+            if diagnostics:
+                sections += f"\n### 执行诊断\n\n{diagnostics[-1]}\n"
+            sections += "请特别注意避免同样的错误。\n"
+            return sections + PROMPT_SUFFIX
     return PROMPT_PREFIX + task.content + PROMPT_SUFFIX
 
 logger = logging.getLogger(__name__)
@@ -220,7 +221,8 @@ def _execute_task(
             task.name,
             result.error,
         )
-        queue.fail(task, result.error)
+        diagnostics = analyze_execution(result)
+        queue.fail(task, result.error, diagnostics=diagnostics)
 
 
 def _execute_with_approval(

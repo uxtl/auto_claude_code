@@ -32,8 +32,9 @@ class TestRetryCount:
 
 class TestExtractErrorContext:
     def test_no_errors(self):
-        errors, clean = extract_error_context("do something\n")
+        errors, diagnostics, clean = extract_error_context("do something\n")
         assert errors == []
+        assert diagnostics == []
         assert "do something" in clean
 
     def test_with_errors(self):
@@ -43,8 +44,9 @@ class TestExtractErrorContext:
             "<!-- RETRY: 1 -->\n"
             "do something\n"
         )
-        errors, clean = extract_error_context(content)
+        errors, diagnostics, clean = extract_error_context(content)
         assert errors == ["timeout"]
+        assert diagnostics == []
         assert "do something" in clean
 
     def test_multiple_errors(self):
@@ -56,7 +58,7 @@ class TestExtractErrorContext:
             "<!-- RETRY: 2 -->\n"
             "do something\n"
         )
-        errors, clean = extract_error_context(content)
+        errors, diagnostics, clean = extract_error_context(content)
         assert len(errors) == 2
         assert "permission denied" in errors
         assert "timeout" in errors
@@ -69,11 +71,57 @@ class TestExtractErrorContext:
             "<!-- RETRY: 2 -->\n"
             "do something\n"
         )
-        errors, clean = extract_error_context(content)
+        errors, diagnostics, clean = extract_error_context(content)
         assert "FAILED" not in clean
         assert "Error:" not in clean
         assert "RETRY" not in clean
         assert "Retries exhausted" not in clean
+        assert "do something" in clean
+
+    def test_multiline_diagnostics(self):
+        """多行诊断块被正确解析."""
+        content = (
+            "<!-- FAILED at 2024-01-01T12:00:00 -->\n"
+            "<!-- Error: some error -->\n"
+            "<!-- Diagnostics:\n"
+            "执行诊断（耗时 45.2s，退出码 1）:\n"
+            "执行摘要: 共 10 次工具调用，3 次失败\n"
+            "-->\n"
+            "<!-- RETRY: 1 -->\n"
+            "do something\n"
+        )
+        errors, diagnostics, clean = extract_error_context(content)
+        assert len(diagnostics) == 1
+        assert "执行诊断" in diagnostics[0]
+        assert "45.2s" in diagnostics[0]
+        assert "Diagnostics" not in clean
+        assert "do something" in clean
+
+    def test_single_line_diagnostics(self):
+        """单行诊断也能解析."""
+        content = (
+            "<!-- Diagnostics: short diagnostic -->\n"
+            "do something\n"
+        )
+        errors, diagnostics, clean = extract_error_context(content)
+        assert diagnostics == ["short diagnostic"]
+        assert "do something" in clean
+
+    def test_clean_content_removes_diagnostics(self):
+        """诊断块不出现在清理后的内容中."""
+        content = (
+            "<!-- FAILED at 2024-01-01 -->\n"
+            "<!-- Error: broke -->\n"
+            "<!-- Diagnostics:\n"
+            "line1\n"
+            "line2\n"
+            "-->\n"
+            "do something\n"
+        )
+        errors, diagnostics, clean = extract_error_context(content)
+        assert "line1" not in clean
+        assert "line2" not in clean
+        assert "-->" not in clean
         assert "do something" in clean
 
 
