@@ -8,7 +8,10 @@ from vibe.approval import ApprovalStore
 from vibe.config import Config
 from vibe.manager import TaskResult
 from vibe.task import Task, TaskQueue
-from vibe.worker import PROMPT_PREFIX, PROMPT_SUFFIX, _docker_kwargs, build_prompt, worker_loop
+from vibe.worker import (
+    PROMPT_PREFIX, PROMPT_SUFFIX, _docker_kwargs, _format_tool_detail,
+    _make_verbose_callback, build_prompt, worker_loop,
+)
 
 
 class TestBuildPrompt:
@@ -311,3 +314,127 @@ class TestDockerKwargs:
         _, kwargs = mock_plan.call_args
         assert kwargs["use_docker"] is True
         assert kwargs["docker_image"] == "plan-img"
+
+
+class TestFormatToolDetail:
+    def test_read(self):
+        assert _format_tool_detail("Read", {"file_path": "/a.py"}) == "/a.py"
+
+    def test_bash(self):
+        assert _format_tool_detail("Bash", {"command": "ls -la"}) == "ls -la"
+
+    def test_bash_long(self):
+        cmd = "x" * 100
+        result = _format_tool_detail("Bash", {"command": cmd})
+        assert result.endswith("...")
+        assert len(result) == 83  # 80 + "..."
+
+    def test_grep(self):
+        assert _format_tool_detail("Grep", {"pattern": "foo.*bar"}) == "foo.*bar"
+
+    def test_unknown(self):
+        assert _format_tool_detail("Unknown", {"x": 1}) == ""
+
+
+class TestMakeVerboseCallback:
+    def test_text_event(self, caplog):
+        import json
+        import logging
+
+        cb = _make_verbose_callback("w0")
+        event = {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Hello world"}]},
+        }
+        with caplog.at_level(logging.INFO, logger="vibe.worker"):
+            cb(json.dumps(event))
+        assert any("[w0]" in r.message and "Hello world" in r.message for r in caplog.records)
+
+    def test_tool_use_event(self, caplog):
+        import json
+        import logging
+
+        cb = _make_verbose_callback("w1")
+        event = {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/foo.py"}}
+                ]
+            },
+        }
+        with caplog.at_level(logging.INFO, logger="vibe.worker"):
+            cb(json.dumps(event))
+        assert any("Read" in r.message and "/foo.py" in r.message for r in caplog.records)
+
+    def test_result_event(self, caplog):
+        import json
+        import logging
+
+        cb = _make_verbose_callback("w0")
+        event = {"type": "result", "result": "All done"}
+        with caplog.at_level(logging.INFO, logger="vibe.worker"):
+            cb(json.dumps(event))
+        assert any("结果" in r.message and "All done" in r.message for r in caplog.records)
+
+    def test_non_json_ignored(self, caplog):
+        import logging
+
+        cb = _make_verbose_callback("w0")
+        with caplog.at_level(logging.INFO, logger="vibe.worker"):
+            cb("not json at all")
+        assert len(caplog.records) == 0
+
+    def test_empty_line_ignored(self, caplog):
+        import logging
+
+        cb = _make_verbose_callback("w0")
+        with caplog.at_level(logging.INFO, logger="vibe.worker"):
+            cb("")
+            cb("   ")
+        assert len(caplog.records) == 0
+
+
+class TestVerboseWiring:
+    def test_verbose_true_passes_on_output(self, workspace: Path):
+        """verbose=True → manager.run_task 收到非 None 的 on_output."""
+        cfg = Config(workspace=str(workspace), verbose=True)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="ok", duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result) as mock_run:
+            worker_loop("w0", cfg, q)
+
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["on_output"] is not None
+        assert callable(kwargs["on_output"])
+
+    def test_verbose_false_passes_none(self, workspace: Path):
+        """verbose=False → manager.run_task 收到 on_output=None."""
+        cfg = Config(workspace=str(workspace), verbose=False)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="ok", duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result) as mock_run:
+            worker_loop("w0", cfg, q)
+
+        mock_run.assert_called_once()
+        _, kwargs = mock_run.call_args
+        assert kwargs["on_output"] is None
+
+    def test_verbose_plan_mode_passes_on_output(self, workspace: Path):
+        """verbose + plan_mode → manager.run_plan 收到非 None 的 on_output."""
+        cfg = Config(workspace=str(workspace), verbose=True, plan_mode=True)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="ok", duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_plan", return_value=mock_result) as mock_plan:
+            worker_loop("w0", cfg, q)
+
+        mock_plan.assert_called_once()
+        _, kwargs = mock_plan.call_args
+        assert kwargs["on_output"] is not None

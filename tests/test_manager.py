@@ -80,6 +80,31 @@ class TestReadStream:
         _read_stream(stream, lines)
         assert lines == ["line1", "line2"]
 
+    def test_on_line_callback(self):
+        stream = io.BytesIO(b"line1\nline2\n")
+        lines: list[str] = []
+        callback_lines: list[str] = []
+        _read_stream(stream, lines, on_line=callback_lines.append)
+        assert callback_lines == ["line1", "line2"]
+
+    def test_on_line_exception_does_not_crash(self):
+        """on_line 抛异常不影响读取."""
+        stream = io.BytesIO(b"line1\nline2\n")
+        lines: list[str] = []
+
+        def bad_callback(line: str) -> None:
+            raise ValueError("boom")
+
+        _read_stream(stream, lines, on_line=bad_callback)
+        assert lines == ["line1", "line2"]
+
+    def test_on_line_none(self):
+        """on_line=None 正常运行."""
+        stream = io.BytesIO(b"line1\n")
+        lines: list[str] = []
+        _read_stream(stream, lines, on_line=None)
+        assert lines == ["line1"]
+
 
 # ── _build_docker_cmd ────────────────────────────────────────
 

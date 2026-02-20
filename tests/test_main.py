@@ -56,6 +56,22 @@ class TestCLIRun:
         assert cfg.plan_auto_approve is True
 
 
+    @patch("vibe.__main__.run_loop")
+    @patch("vibe.__main__.load_config")
+    def test_run_verbose(self, mock_load, mock_loop, workspace: Path):
+        cfg = MagicMock()
+        cfg.workspace = str(workspace)
+        cfg.log_level = "INFO"
+        cfg.log_file = ""
+        cfg.plan_mode = False
+        cfg.plan_auto_approve = True
+        mock_load.return_value = cfg
+
+        with patch("sys.argv", ["vibe", "run", "--verbose"]):
+            main()
+        assert cfg.verbose is True
+
+
 class TestCLIList:
     def test_list(self, workspace: Path, capsys):
         (workspace / "tasks" / "001_todo.md").write_text("task", encoding="utf-8")

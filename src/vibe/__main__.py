@@ -38,6 +38,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         config.use_docker = True
     if args.docker_image:
         config.docker_image = args.docker_image
+    if args.verbose:
+        config.verbose = True
     if config.plan_mode and not config.plan_auto_approve:
         print(
             "WARNING: plan_auto_approve=False 在 CLI 模式下无法审批（无 Web 服务器），"
@@ -59,6 +61,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         config.use_docker = True
     if args.docker_image:
         config.docker_image = args.docker_image
+    if args.verbose:
+        config.verbose = True
     _setup_logging(config)
 
     from .server import start_server
@@ -187,6 +191,7 @@ def main() -> None:
     p_run.add_argument("--plan-mode", action="store_true", help="启用 Plan 模式（先生成计划再执行）")
     p_run.add_argument("--docker", action="store_true", help="启用 Docker 隔离模式")
     p_run.add_argument("--docker-image", default=None, help="Docker 镜像名（默认 auto-claude-code）")
+    p_run.add_argument("--verbose", "-v", action="store_true", help="实时输出 Claude Code 执行进度")
     p_run.set_defaults(func=cmd_run)
 
     # serve
@@ -197,6 +202,7 @@ def main() -> None:
     p_serve.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
     p_serve.add_argument("--docker", action="store_true", help="启用 Docker 隔离模式")
     p_serve.add_argument("--docker-image", default=None, help="Docker 镜像名（默认 auto-claude-code）")
+    p_serve.add_argument("--verbose", "-v", action="store_true", help="实时输出 Claude Code 执行进度")
     p_serve.set_defaults(func=cmd_serve)
 
     # list

@@ -122,3 +122,19 @@ class TestLoadConfig:
         )
         cfg = load_config(workspace=tmp_path)
         assert cfg.poll_interval == 15
+
+    def test_verbose_default(self, tmp_path: Path):
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.verbose is False
+
+    def test_verbose_env_override(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("VIBE_VERBOSE", "true")
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.verbose is True
+
+    def test_verbose_dotenv(self, tmp_path: Path):
+        (tmp_path / ".env").write_text(
+            "VIBE_VERBOSE=true\n", encoding="utf-8"
+        )
+        cfg = load_config(workspace=tmp_path)
+        assert cfg.verbose is True

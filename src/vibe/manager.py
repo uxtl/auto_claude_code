@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,12 +29,21 @@ class TaskResult:
     return_code: int | None = None
 
 
-def _read_stream(stream, lines: list[str]) -> None:
+def _read_stream(
+    stream,
+    lines: list[str],
+    on_line: Callable[[str], None] | None = None,
+) -> None:
     """在线程中读取子进程的输出流."""
     try:
         for raw_line in stream:
             line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
             lines.append(line)
+            if on_line is not None:
+                try:
+                    on_line(line)
+                except Exception:
+                    pass  # never crash the reader thread
     finally:
         stream.close()
 
@@ -221,6 +231,7 @@ def _run_claude(
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
     shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """执行 claude 命令的公共子进程管理逻辑.
 
@@ -267,8 +278,12 @@ def _run_claude(
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
 
-    stdout_thread = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines), daemon=True)
-    stderr_thread = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_lines), daemon=True)
+    stdout_thread = threading.Thread(
+        target=_read_stream, args=(proc.stdout, stdout_lines, on_output), daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_read_stream, args=(proc.stderr, stderr_lines), daemon=True,
+    )
     stdout_thread.start()
     stderr_thread.start()
 
@@ -362,6 +377,7 @@ def run_task(
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
     shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """启动 Claude Code 执行任务，等待完成并返回结构化结果.
 
@@ -372,6 +388,7 @@ def run_task(
         use_docker: 是否在 Docker 容器中执行
         docker_image: Docker 镜像名
         docker_extra_args: 额外 docker run 参数
+        on_output: 可选回调，每读到一行 stdout 时调用
     """
     cwd = Path(cwd).resolve()
     logger.info("启动 Claude Code 任务，工作目录: %s", cwd)
@@ -391,6 +408,7 @@ def run_task(
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
         shutdown_event=shutdown_event,
+        on_output=on_output,
     )
 
     if result.success:
@@ -412,6 +430,7 @@ def generate_plan(
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
     shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """生成执行计划（不带 --dangerously-skip-permissions）.
 
@@ -440,6 +459,7 @@ def generate_plan(
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
         shutdown_event=shutdown_event,
+        on_output=on_output,
     )
 
     if not result.success and "超时" in result.error:
@@ -461,6 +481,7 @@ def execute_plan(
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
     shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """按计划执行（带 --dangerously-skip-permissions），自动前缀 [计划]/[执行结果].
 
@@ -471,6 +492,7 @@ def execute_plan(
         use_docker: 是否在 Docker 容器中执行
         docker_image: Docker 镜像名
         docker_extra_args: 额外 docker run 参数
+        on_output: 可选回调，每读到一行 stdout 时调用
     """
     logger.info("[Plan Mode] 第二步：按计划执行")
     exec_prompt = (
@@ -485,6 +507,7 @@ def execute_plan(
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
         shutdown_event=shutdown_event,
+        on_output=on_output,
     )
 
     # 将计划内容附加到输出前面
@@ -505,6 +528,7 @@ def run_plan(
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
     shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """Plan 模式：先生成计划，再按计划执行（向后兼容包装）."""
     start_time = time.monotonic()
@@ -515,6 +539,7 @@ def run_plan(
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
         shutdown_event=shutdown_event,
+        on_output=on_output,
     )
     if not plan_result.success:
         return plan_result
@@ -529,6 +554,7 @@ def run_plan(
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
         shutdown_event=shutdown_event,
+        on_output=on_output,
     )
     exec_result.duration_seconds = time.monotonic() - start_time
     return exec_result

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from . import manager
@@ -69,6 +71,67 @@ def _docker_kwargs(config: Config) -> dict:
     }
 
 
+def _format_tool_detail(tool_name: str, tool_input: dict) -> str:
+    """从工具调用中提取关键细节用于日志显示."""
+    if tool_name in ("Read", "Write", "Edit"):
+        return tool_input.get("file_path", "")
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        return cmd[:80] + ("..." if len(cmd) > 80 else "")
+    if tool_name in ("Grep", "Glob"):
+        return tool_input.get("pattern", "")
+    if tool_name == "Task":
+        return tool_input.get("description", "")
+    if tool_name == "WebFetch":
+        return tool_input.get("url", "")
+    return ""
+
+
+def _make_verbose_callback(worker_id: str) -> Callable[[str], None]:
+    """创建 verbose 回调闭包，解析 stream-json 事件并记录日志."""
+
+    def _on_output(line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return
+
+        event_type = event.get("type", "")
+
+        if event_type == "assistant" and "message" in event:
+            message = event["message"]
+            if not isinstance(message, dict):
+                return
+            for block in message.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type", "")
+                if block_type == "text":
+                    text = block["text"].strip()
+                    preview = text[:120] + ("..." if len(text) > 120 else "")
+                    logger.info("[%s] 💬 %s", worker_id, preview)
+                elif block_type == "tool_use":
+                    name = block.get("name", "?")
+                    detail = _format_tool_detail(name, block.get("input", {}))
+                    if detail:
+                        logger.info("[%s] 🔧 %s → %s", worker_id, name, detail)
+                    else:
+                        logger.info("[%s] 🔧 %s", worker_id, name)
+
+        elif event_type == "result":
+            result_data = event.get("result", "")
+            if isinstance(result_data, str) and result_data.strip():
+                preview = result_data.strip()[:120]
+                if len(result_data.strip()) > 120:
+                    preview += "..."
+                logger.info("[%s] ✅ 结果: %s", worker_id, preview)
+
+    return _on_output
+
+
 def worker_loop(
     worker_id: str,
     config: Config,
@@ -111,6 +174,7 @@ def _execute_task(
     """执行单个任务并处理结果."""
     prompt = build_prompt(task)
     docker_kw = _docker_kwargs(config)
+    on_output = _make_verbose_callback(worker_id) if config.verbose else None
 
     if (
         config.plan_mode
@@ -120,17 +184,18 @@ def _execute_task(
         result = _execute_with_approval(
             worker_id, prompt, cwd, config.timeout, task.name, approval_store,
             shutdown_event=shutdown_event,
+            on_output=on_output,
             **docker_kw,
         )
     elif config.plan_mode:
         result = manager.run_plan(
             prompt, cwd=cwd, timeout=config.timeout,
-            shutdown_event=shutdown_event, **docker_kw,
+            shutdown_event=shutdown_event, on_output=on_output, **docker_kw,
         )
     else:
         result = manager.run_task(
             prompt, cwd=cwd, timeout=config.timeout,
-            shutdown_event=shutdown_event, **docker_kw,
+            shutdown_event=shutdown_event, on_output=on_output, **docker_kw,
         )
 
     # 优先检查关闭信号：释放任务回队列而不是归档
@@ -167,6 +232,7 @@ def _execute_with_approval(
     approval_store: ApprovalStore,
     *,
     shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
@@ -185,7 +251,7 @@ def _execute_with_approval(
     # Step 1: 生成计划
     plan_result = manager.generate_plan(
         prompt, cwd=cwd, timeout=timeout,
-        shutdown_event=shutdown_event, **docker_kw,
+        shutdown_event=shutdown_event, on_output=on_output, **docker_kw,
     )
     if not plan_result.success:
         return plan_result
@@ -223,7 +289,7 @@ def _execute_with_approval(
 
     exec_result = manager.execute_plan(
         plan_text, cwd=cwd, timeout=remaining_timeout,
-        shutdown_event=shutdown_event, **docker_kw,
+        shutdown_event=shutdown_event, on_output=on_output, **docker_kw,
     )
     exec_result.duration_seconds = time.monotonic() - start_time
     return exec_result
