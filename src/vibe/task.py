@@ -90,6 +90,16 @@ class TaskQueue:
             retries=retries,
         )
 
+    def release(self, task: Task) -> None:
+        """释放任务回队列: 将 .running.{worker_id} 重命名回 .md."""
+        original_name = task.path.name.split(".running.")[0]
+        dest = self._task_dir / original_name
+        try:
+            task.path.rename(dest)
+            logger.info("任务已释放回队列: %s → %s", task.path.name, original_name)
+        except OSError as e:
+            logger.error("释放任务 %s 失败: %s", task.name, e)
+
     def complete(self, task: Task) -> None:
         """将完成的任务移到 done/ 目录（带时间戳）."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

@@ -2,6 +2,7 @@
 
 import io
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,7 +10,7 @@ import pytest
 
 from vibe.manager import (
     TaskResult, _build_docker_cmd, _parse_stream_json, _read_stream,
-    check_docker_available, ensure_docker_image,
+    _run_claude, check_docker_available, ensure_docker_image,
     execute_plan, generate_plan, run_plan, run_task,
 )
 
@@ -260,11 +261,18 @@ class TestRunTask:
         mock_proc = MagicMock()
         mock_proc.stdout = io.BytesIO(b"")
         mock_proc.stderr = io.BytesIO(b"")
-        # First call (with timeout=) raises; second call (after kill) succeeds
-        mock_proc.wait.side_effect = [subprocess.TimeoutExpired("claude", 10), None]
-        mock_proc.kill.return_value = None
+        # wait 始终超时（模拟长时间运行的进程），直到 kill 后正常返回
+        mock_proc.wait.side_effect = subprocess.TimeoutExpired("claude", 0.5)
+        mock_proc.kill.side_effect = lambda: setattr(
+            mock_proc, 'wait', MagicMock(return_value=None),
+        )
 
-        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc):
+        with (
+            patch("vibe.manager.subprocess.Popen", return_value=mock_proc),
+            patch("vibe.manager.time.monotonic") as mock_time,
+        ):
+            # 模拟时间: 启动时 0, 第一次 poll 超时后 11 (超过 timeout=10)
+            mock_time.side_effect = [0, 11, 11]
             result = run_task("hello", cwd=tmp_path, timeout=10)
         assert result.success is False
         assert "超时" in result.error
@@ -438,3 +446,53 @@ class TestExecutePlan:
         assert "[计划]" in result.output
         assert "my plan text" in result.output
         assert "[执行结果]" in result.output
+
+
+# ── shutdown_event ──────────────────────────────────────────
+
+class TestShutdownEvent:
+    def test_shutdown_terminates_process(self, tmp_path):
+        """shutdown_event 被 set 时子进程被终止，返回 success=False."""
+        import subprocess as _sp
+
+        evt = threading.Event()
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"")
+        mock_proc.stderr = io.BytesIO(b"")
+        mock_proc.returncode = -15  # SIGTERM
+
+        # 第一次 wait (poll loop) 超时，terminate 后第二次 wait 正常返回
+        mock_proc.wait.side_effect = [
+            _sp.TimeoutExpired("claude", 0.5),  # poll interval
+            None,  # after terminate
+        ]
+
+        # 在 poll loop 期间 set shutdown event
+        evt.set()
+
+        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc):
+            result = _run_claude(
+                ["claude", "-p", "test"], tmp_path, timeout=30,
+                shutdown_event=evt,
+            )
+
+        assert result.success is False
+        assert "关闭信号" in result.error
+        mock_proc.terminate.assert_called_once()
+
+    def test_no_shutdown_event_normal_exit(self, tmp_path):
+        """shutdown_event=None 时正常执行不受影响."""
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"")
+        mock_proc.stderr = io.BytesIO(b"")
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+
+        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc):
+            result = _run_claude(
+                ["claude", "-p", "test"], tmp_path, timeout=30,
+                shutdown_event=None,
+            )
+
+        assert result.success is True

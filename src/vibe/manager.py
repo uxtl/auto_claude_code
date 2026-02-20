@@ -220,6 +220,7 @@ def _run_claude(
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
+    shutdown_event: threading.Event | None = None,
 ) -> TaskResult:
     """执行 claude 命令的公共子进程管理逻辑.
 
@@ -271,26 +272,57 @@ def _run_claude(
     stdout_thread.start()
     stderr_thread.start()
 
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        duration = time.monotonic() - start_time
-        logger.warning("执行超时（%d 秒），终止进程", timeout)
-        proc.kill()
-        proc.wait()
-        stdout_thread.join(timeout=5)
-        if stdout_thread.is_alive():
-            logger.warning("stdout 读取线程在 join 超时后仍在运行")
-        stderr_thread.join(timeout=5)
-        if stderr_thread.is_alive():
-            logger.warning("stderr 读取线程在 join 超时后仍在运行")
-        return TaskResult(
-            success=False,
-            error=f"执行超时（{timeout} 秒）",
-            output="\n".join(stdout_lines),
-            duration_seconds=duration,
-            return_code=None,
-        )
+    # 轮询等待子进程结束，每 0.5s 检查一次 shutdown_event
+    deadline = start_time + timeout
+    poll_interval = 0.5
+
+    while True:
+        try:
+            proc.wait(timeout=poll_interval)
+            break  # 子进程已结束
+        except subprocess.TimeoutExpired:
+            pass
+
+        # 检查关闭信号
+        if shutdown_event is not None and shutdown_event.is_set():
+            duration = time.monotonic() - start_time
+            logger.warning("收到关闭信号，终止子进程")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stdout_thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
+            interrupted = True
+            return TaskResult(
+                success=False,
+                error="中断: 收到关闭信号",
+                output="\n".join(stdout_lines),
+                duration_seconds=duration,
+                return_code=proc.returncode,
+            )
+
+        # 检查超时
+        if time.monotonic() >= deadline:
+            duration = time.monotonic() - start_time
+            logger.warning("执行超时（%d 秒），终止进程", timeout)
+            proc.kill()
+            proc.wait()
+            stdout_thread.join(timeout=5)
+            if stdout_thread.is_alive():
+                logger.warning("stdout 读取线程在 join 超时后仍在运行")
+            stderr_thread.join(timeout=5)
+            if stderr_thread.is_alive():
+                logger.warning("stderr 读取线程在 join 超时后仍在运行")
+            return TaskResult(
+                success=False,
+                error=f"执行超时（{timeout} 秒）",
+                output="\n".join(stdout_lines),
+                duration_seconds=duration,
+                return_code=None,
+            )
 
     duration = time.monotonic() - start_time
     stdout_thread.join(timeout=10)
@@ -329,6 +361,7 @@ def run_task(
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
+    shutdown_event: threading.Event | None = None,
 ) -> TaskResult:
     """启动 Claude Code 执行任务，等待完成并返回结构化结果.
 
@@ -357,6 +390,7 @@ def run_task(
         use_docker=use_docker,
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
+        shutdown_event=shutdown_event,
     )
 
     if result.success:
@@ -377,6 +411,7 @@ def generate_plan(
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
+    shutdown_event: threading.Event | None = None,
 ) -> TaskResult:
     """生成执行计划（不带 --dangerously-skip-permissions）.
 
@@ -404,6 +439,7 @@ def generate_plan(
         use_docker=use_docker,
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
+        shutdown_event=shutdown_event,
     )
 
     if not result.success and "超时" in result.error:
@@ -424,6 +460,7 @@ def execute_plan(
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
+    shutdown_event: threading.Event | None = None,
 ) -> TaskResult:
     """按计划执行（带 --dangerously-skip-permissions），自动前缀 [计划]/[执行结果].
 
@@ -447,6 +484,7 @@ def execute_plan(
         use_docker=use_docker,
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
+        shutdown_event=shutdown_event,
     )
 
     # 将计划内容附加到输出前面
@@ -466,6 +504,7 @@ def run_plan(
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
+    shutdown_event: threading.Event | None = None,
 ) -> TaskResult:
     """Plan 模式：先生成计划，再按计划执行（向后兼容包装）."""
     start_time = time.monotonic()
@@ -475,6 +514,7 @@ def run_plan(
         use_docker=use_docker,
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
+        shutdown_event=shutdown_event,
     )
     if not plan_result.success:
         return plan_result
@@ -488,6 +528,7 @@ def run_plan(
         use_docker=use_docker,
         docker_image=docker_image,
         docker_extra_args=docker_extra_args,
+        shutdown_event=shutdown_event,
     )
     exec_result.duration_seconds = time.monotonic() - start_time
     return exec_result

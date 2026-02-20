@@ -256,6 +256,33 @@ class TestRetryFailed:
         assert retried == []
 
 
+class TestRelease:
+    def test_release_back_to_queue(self, queue: TaskQueue, workspace: Path):
+        """release 后 .running 文件重命名回 .md."""
+        (workspace / "tasks" / "001_test.md").write_text("task content", encoding="utf-8")
+        task = queue.claim_next("w0")
+        assert task is not None
+        assert task.path.name == "001_test.md.running.w0"
+
+        queue.release(task)
+        # .running 文件已消失
+        assert not task.path.exists()
+        # 原始 .md 文件恢复
+        restored = workspace / "tasks" / "001_test.md"
+        assert restored.exists()
+        assert restored.read_text(encoding="utf-8") == "task content"
+
+    def test_release_can_be_reclaimed(self, queue: TaskQueue, workspace: Path):
+        """release 后任务可被再次 claim."""
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+        task = queue.claim_next("w0")
+        queue.release(task)
+
+        task2 = queue.claim_next("w1")
+        assert task2 is not None
+        assert task2.name == "001_test"
+
+
 class TestRecover:
     def test_recover_running(self, workspace: Path):
         task_dir = workspace / "tasks"

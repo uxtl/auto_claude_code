@@ -119,12 +119,25 @@ def _execute_task(
     ):
         result = _execute_with_approval(
             worker_id, prompt, cwd, config.timeout, task.name, approval_store,
+            shutdown_event=shutdown_event,
             **docker_kw,
         )
     elif config.plan_mode:
-        result = manager.run_plan(prompt, cwd=cwd, timeout=config.timeout, **docker_kw)
+        result = manager.run_plan(
+            prompt, cwd=cwd, timeout=config.timeout,
+            shutdown_event=shutdown_event, **docker_kw,
+        )
     else:
-        result = manager.run_task(prompt, cwd=cwd, timeout=config.timeout, **docker_kw)
+        result = manager.run_task(
+            prompt, cwd=cwd, timeout=config.timeout,
+            shutdown_event=shutdown_event, **docker_kw,
+        )
+
+    # 优先检查关闭信号：释放任务回队列而不是归档
+    if shutdown_event.is_set():
+        logger.info("[%s] 收到关闭信号，释放任务回队列: %s", worker_id, task.name)
+        queue.release(task)
+        return
 
     if result.success:
         logger.info(
@@ -153,6 +166,7 @@ def _execute_with_approval(
     task_name: str,
     approval_store: ApprovalStore,
     *,
+    shutdown_event: threading.Event | None = None,
     use_docker: bool = False,
     docker_image: str = "auto-claude-code",
     docker_extra_args: str = "",
@@ -169,7 +183,10 @@ def _execute_with_approval(
     start_time = time.monotonic()
 
     # Step 1: 生成计划
-    plan_result = manager.generate_plan(prompt, cwd=cwd, timeout=timeout, **docker_kw)
+    plan_result = manager.generate_plan(
+        prompt, cwd=cwd, timeout=timeout,
+        shutdown_event=shutdown_event, **docker_kw,
+    )
     if not plan_result.success:
         return plan_result
 
@@ -205,7 +222,8 @@ def _execute_with_approval(
         remaining_timeout = 60
 
     exec_result = manager.execute_plan(
-        plan_text, cwd=cwd, timeout=remaining_timeout, **docker_kw,
+        plan_text, cwd=cwd, timeout=remaining_timeout,
+        shutdown_event=shutdown_event, **docker_kw,
     )
     exec_result.duration_seconds = time.monotonic() - start_time
     return exec_result

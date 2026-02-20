@@ -203,6 +203,62 @@ class TestApprovalFlow:
         assert store.list_pending() == []
 
 
+class TestInterruptedRelease:
+    def test_shutdown_releases_task(self, workspace: Path, config: Config, queue: TaskQueue):
+        """shutdown_event 被 set 时任务释放回 tasks/ 而不是 done/."""
+        from vibe.worker import shutdown_event
+
+        (workspace / "tasks" / "001_test.md").write_text("task content", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+
+        def run_task_and_shutdown(*args, **kwargs):
+            # 在 manager 返回前设置 shutdown 信号
+            shutdown_event.set()
+            return mock_result
+
+        with patch("vibe.worker.manager.run_task", side_effect=run_task_and_shutdown):
+            worker_loop("w0", config, queue)
+
+        # 清理 shutdown_event 供其他测试使用
+        shutdown_event.clear()
+
+        # 任务不应在 done/ 中
+        done_files = list((workspace / "tasks" / "done").glob("*.md"))
+        assert len(done_files) == 0
+
+        # 任务应回到 tasks/ 中
+        restored = workspace / "tasks" / "001_test.md"
+        assert restored.exists()
+        assert restored.read_text(encoding="utf-8") == "task content"
+
+    def test_shutdown_does_not_fail_task(self, workspace: Path):
+        """shutdown 时任务不应被移到 failed/."""
+        from vibe.worker import shutdown_event
+
+        cfg = Config(workspace=str(workspace), max_retries=3)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("task content", encoding="utf-8")
+
+        mock_result = TaskResult(success=False, error="中断: 收到关闭信号", duration_seconds=0.1)
+
+        def run_task_and_shutdown(*args, **kwargs):
+            shutdown_event.set()
+            return mock_result
+
+        with patch("vibe.worker.manager.run_task", side_effect=run_task_and_shutdown):
+            worker_loop("w0", cfg, q)
+
+        shutdown_event.clear()
+
+        # 不应在 failed/
+        failed_files = list((workspace / "tasks" / "failed").glob("*.md"))
+        assert len(failed_files) == 0
+
+        # 应回到 tasks/
+        assert (workspace / "tasks" / "001_test.md").exists()
+
+
 class TestDockerKwargs:
     def test_default_config(self):
         cfg = Config()
