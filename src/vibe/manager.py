@@ -121,7 +121,7 @@ def _build_docker_cmd(
         "docker", "run",
         "--rm", "-i",
         "-v", f"{cwd}:/workspace",
-        "-v", f"{home / '.claude'}:/home/user/.claude",
+        "-v", f"{home / '.claude'}:/home/user/.claude:ro",
         "-w", "/workspace",
         "-e", "ANTHROPIC_API_KEY",
     ]

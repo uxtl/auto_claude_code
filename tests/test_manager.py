@@ -104,7 +104,7 @@ class TestBuildDockerCmd:
         # 收集所有 -v 挂载
         volumes = [result[i + 1] for i, v in enumerate(result) if v == "-v"]
         assert "/my/project:/workspace" in volumes
-        assert f"{fake_home / '.claude'}:/home/user/.claude" in volumes
+        assert f"{fake_home / '.claude'}:/home/user/.claude:ro" in volumes
         assert f"{fake_home / '.claude.json'}:/home/user/.claude.json:ro" in volumes
         # --user UID:GID
         user_idx = result.index("--user")
