@@ -83,16 +83,25 @@ class TestReadStream:
 # ── _build_docker_cmd ────────────────────────────────────────
 
 class TestBuildDockerCmd:
-    def test_basic(self):
+    def test_basic(self, tmp_path):
         claude_cmd = ["claude", "-p", "hello", "--output-format", "stream-json"]
-        result = _build_docker_cmd(claude_cmd, Path("/my/project"), "my-image")
+        # 创建 ~/.claude.json 模拟文件
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        (fake_home / ".claude.json").write_text("{}", encoding="utf-8")
+
+        with patch("vibe.manager.Path.home", return_value=fake_home):
+            result = _build_docker_cmd(claude_cmd, Path("/my/project"), "my-image")
         assert result[:2] == ["docker", "run"]
         assert "--rm" in result
         assert "-i" in result
         assert "-v" in result
-        # 找到 -v 后面的参数
-        v_idx = result.index("-v")
-        assert result[v_idx + 1] == "/my/project:/workspace"
+        # 收集所有 -v 挂载
+        volumes = [result[i + 1] for i, v in enumerate(result) if v == "-v"]
+        assert "/my/project:/workspace" in volumes
+        assert f"{fake_home / '.claude'}:/home/vibe/.claude" in volumes
+        assert f"{fake_home / '.claude.json'}:/home/vibe/.claude.json" in volumes
         # -w /workspace
         w_idx = result.index("-w")
         assert result[w_idx + 1] == "/workspace"

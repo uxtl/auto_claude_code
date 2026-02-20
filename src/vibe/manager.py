@@ -116,14 +116,19 @@ def _build_docker_cmd(
         docker_image: Docker 镜像名称
         docker_extra_args: 额外 docker run 参数字符串
     """
+    home = Path.home()
     cmd = [
         "docker", "run",
         "--rm", "-i",
         "-v", f"{cwd}:/workspace",
-        "-v", f"{Path.home() / '.claude'}:/root/.claude:ro",
+        "-v", f"{home / '.claude'}:/home/vibe/.claude",
         "-w", "/workspace",
         "-e", "ANTHROPIC_API_KEY",
     ]
+    # 挂载 ~/.claude.json（如果存在）
+    claude_json = home / ".claude.json"
+    if claude_json.is_file():
+        cmd.extend(["-v", f"{claude_json}:/home/vibe/.claude.json"])
     if docker_extra_args:
         cmd.extend(shlex.split(docker_extra_args))
     cmd.append(docker_image)
