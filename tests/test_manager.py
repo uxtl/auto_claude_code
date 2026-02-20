@@ -130,17 +130,23 @@ class TestBuildDockerCmd:
         # 收集所有 -v 挂载
         volumes = [result[i + 1] for i, v in enumerate(result) if v == "-v"]
         assert "/my/project:/workspace" in volumes
-        assert f"{fake_home / '.claude'}:/home/user/.claude:ro" in volumes
-        assert f"{fake_home / '.claude.json'}:/home/user/.claude.json:ro" in volumes
+        assert f"{fake_home / '.claude'}:/home/user/.claude" in volumes
+        assert f"{fake_home / '.claude.json'}:/home/user/.claude.json" in volumes
+        # 挂载不应包含 :ro
+        for v in volumes:
+            if "/home/user/.claude" in v:
+                assert ":ro" not in v, f"mount should be rw: {v}"
         # --user UID:GID
         user_idx = result.index("--user")
         assert result[user_idx + 1] == "1000:1000"
         # -w /workspace
         w_idx = result.index("-w")
         assert result[w_idx + 1] == "/workspace"
+        # -e HOME=/home/user 确保容器 HOME 指向挂载路径
+        env_args = [result[i + 1] for i, v in enumerate(result) if v == "-e"]
+        assert "HOME=/home/user" in env_args
         # -e ANTHROPIC_API_KEY
-        e_idx = result.index("-e")
-        assert result[e_idx + 1] == "ANTHROPIC_API_KEY"
+        assert "ANTHROPIC_API_KEY" in env_args
         # 镜像名
         assert "my-image" in result
         # claude 命令在末尾
