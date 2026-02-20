@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import shlex
 import subprocess
 import threading
@@ -119,6 +120,7 @@ def _build_docker_cmd(
         "docker", "run",
         "--rm", "-i",
         "-v", f"{cwd}:/workspace",
+        "-v", f"{Path.home() / '.claude'}:/root/.claude:ro",
         "-w", "/workspace",
         "-e", "ANTHROPIC_API_KEY",
     ]
@@ -231,12 +233,16 @@ def _run_claude(
 
     start_time = time.monotonic()
 
+    # 清除 CLAUDECODE 环境变量，允许嵌套调用（从 Claude Code 会话内启动子进程）
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
     try:
         proc = subprocess.Popen(
             actual_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=proc_cwd,
+            env=env,
         )
     except FileNotFoundError:
         bin_name = "docker" if use_docker else "claude"
