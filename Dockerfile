@@ -9,9 +9,9 @@ RUN apt-get update && apt-get install -y \
     npm install -g @anthropic-ai/claude-code && \
     rm -rf /var/lib/apt/lists/*
 
-# 创建非 root 用户（Claude CLI 拒绝 root + --dangerously-skip-permissions）
-RUN useradd -m -s /bin/bash vibe
-ENV PATH="/home/vibe/.local/bin:/root/.local/bin:$PATH"
+# 任意 UID 均可写入的 home（运行时通过 --user 指定 UID）
+RUN mkdir -p /home/user && chmod 777 /home/user
+ENV HOME=/home/user
+ENV PATH="/usr/local/bin:/root/.local/bin:$PATH"
 
-USER vibe
 WORKDIR /workspace

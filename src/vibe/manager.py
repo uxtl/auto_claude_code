@@ -121,14 +121,19 @@ def _build_docker_cmd(
         "docker", "run",
         "--rm", "-i",
         "-v", f"{cwd}:/workspace",
-        "-v", f"{home / '.claude'}:/home/vibe/.claude",
+        "-v", f"{home / '.claude'}:/home/user/.claude",
         "-w", "/workspace",
         "-e", "ANTHROPIC_API_KEY",
     ]
+    # UID=0 时跳过 --user（Claude CLI 拒绝 root + --dangerously-skip-permissions）
+    uid = os.getuid()
+    if uid != 0:
+        gid = os.getgid()
+        cmd.extend(["--user", f"{uid}:{gid}"])
     # 挂载 ~/.claude.json（如果存在）
     claude_json = home / ".claude.json"
     if claude_json.is_file():
-        cmd.extend(["-v", f"{claude_json}:/home/vibe/.claude.json"])
+        cmd.extend(["-v", f"{claude_json}:/home/user/.claude.json:ro"])
     if docker_extra_args:
         cmd.extend(shlex.split(docker_extra_args))
     cmd.append(docker_image)

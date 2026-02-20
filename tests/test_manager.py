@@ -91,7 +91,11 @@ class TestBuildDockerCmd:
         (fake_home / ".claude").mkdir()
         (fake_home / ".claude.json").write_text("{}", encoding="utf-8")
 
-        with patch("vibe.manager.Path.home", return_value=fake_home):
+        with (
+            patch("vibe.manager.Path.home", return_value=fake_home),
+            patch("os.getuid", return_value=1000),
+            patch("os.getgid", return_value=1000),
+        ):
             result = _build_docker_cmd(claude_cmd, Path("/my/project"), "my-image")
         assert result[:2] == ["docker", "run"]
         assert "--rm" in result
@@ -100,8 +104,11 @@ class TestBuildDockerCmd:
         # 收集所有 -v 挂载
         volumes = [result[i + 1] for i, v in enumerate(result) if v == "-v"]
         assert "/my/project:/workspace" in volumes
-        assert f"{fake_home / '.claude'}:/home/vibe/.claude" in volumes
-        assert f"{fake_home / '.claude.json'}:/home/vibe/.claude.json" in volumes
+        assert f"{fake_home / '.claude'}:/home/user/.claude" in volumes
+        assert f"{fake_home / '.claude.json'}:/home/user/.claude.json:ro" in volumes
+        # --user UID:GID
+        user_idx = result.index("--user")
+        assert result[user_idx + 1] == "1000:1000"
         # -w /workspace
         w_idx = result.index("-w")
         assert result[w_idx + 1] == "/workspace"
@@ -112,6 +119,20 @@ class TestBuildDockerCmd:
         assert "my-image" in result
         # claude 命令在末尾
         assert result[-5:] == claude_cmd
+
+    def test_root_user_no_user_flag(self, tmp_path):
+        """UID=0 时不应添加 --user 参数."""
+        claude_cmd = ["claude", "-p", "hello"]
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+
+        with (
+            patch("vibe.manager.Path.home", return_value=fake_home),
+            patch("os.getuid", return_value=0),
+        ):
+            result = _build_docker_cmd(claude_cmd, Path("/proj"), "img")
+        assert "--user" not in result
 
     def test_extra_args(self):
         claude_cmd = ["claude", "-p", "hi"]
