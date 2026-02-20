@@ -125,7 +125,7 @@ class TestBuildDockerCmd:
             result = _build_docker_cmd(claude_cmd, Path("/my/project"), "my-image")
         assert result[:2] == ["docker", "run"]
         assert "--rm" in result
-        assert "-i" in result
+        assert "-i" not in result  # no interactive flag for batch mode
         assert "-v" in result
         # 收集所有 -v 挂载
         volumes = [result[i + 1] for i, v in enumerate(result) if v == "-v"]

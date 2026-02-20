@@ -47,7 +47,8 @@ def run_loop(
         ok, msg = check_docker_available()
         if not ok:
             raise RuntimeError(f"Docker 隔离模式启用但 Docker 不可用: {msg}")
-        ok, msg = ensure_docker_image(config.docker_image, workspace)
+        scaffold_dir = Path(__file__).resolve().parent.parent.parent  # src/vibe -> src -> project root
+        ok, msg = ensure_docker_image(config.docker_image, scaffold_dir)
         if not ok:
             raise RuntimeError(f"Docker 镜像准备失败: {msg}")
         logger.info("Docker 隔离模式已启用，镜像: %s", config.docker_image)

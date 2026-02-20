@@ -129,7 +129,7 @@ def _build_docker_cmd(
     home = Path.home()
     cmd = [
         "docker", "run",
-        "--rm", "-i",
+        "--rm",
         "-v", f"{cwd}:/workspace",
         "-v", f"{home / '.claude'}:/home/user/.claude:ro",
         "-w", "/workspace",
@@ -258,9 +258,14 @@ def _run_claude(
     # 清除 CLAUDECODE 环境变量，允许嵌套调用（从 Claude Code 会话内启动子进程）
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
+    logger.debug("执行命令: %s", " ".join(actual_cmd))
+    if use_docker:
+        logger.info("Docker 命令启动: docker run ... %s", docker_image)
+
     try:
         proc = subprocess.Popen(
             actual_cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=proc_cwd,
@@ -275,15 +280,21 @@ def _run_claude(
         logger.error("启动失败: %s", e)
         return TaskResult(success=False, error=f"启动失败: {e}")
 
+    logger.info("子进程已启动, PID=%d", proc.pid)
+
     # 使用线程读取 stdout 和 stderr，避免死锁
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
+
+    def _stderr_logger(line: str) -> None:
+        if line.strip():
+            logger.warning("stderr: %s", line)
 
     stdout_thread = threading.Thread(
         target=_read_stream, args=(proc.stdout, stdout_lines, on_output), daemon=True,
     )
     stderr_thread = threading.Thread(
-        target=_read_stream, args=(proc.stderr, stderr_lines), daemon=True,
+        target=_read_stream, args=(proc.stderr, stderr_lines, _stderr_logger), daemon=True,
     )
     stdout_thread.start()
     stderr_thread.start()
