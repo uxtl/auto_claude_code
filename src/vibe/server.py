@@ -36,7 +36,10 @@ class _SSELogHandler(logging.Handler):
         loop = _loop
         event = _log_event
         if loop is not None and event is not None:
-            loop.call_soon_threadsafe(event.set)
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass  # Event loop 已关闭（进程退出期间）
 
 
 def _install_log_handler() -> None:
@@ -67,6 +70,9 @@ def create_app(
         _loop = asyncio.get_running_loop()
         _log_event = asyncio.Event()
         yield
+        # Uvicorn 正在关闭 — 通知 worker 线程停止
+        from .worker import shutdown_event as _se
+        _se.set()
         _loop = None
         _log_event = None
 
@@ -259,10 +265,27 @@ def create_app(
 
 def start_server(config: Config, host: str = "0.0.0.0", port: int = 8080) -> None:
     """启动 Web 服务器，同时在后台线程运行任务循环."""
+    import signal
+
     import uvicorn
+
+    from .worker import shutdown_event
 
     # 创建共享的审批存储
     store = ApprovalStore() if (config.plan_mode and not config.plan_auto_approve) else None
+
+    # 在主线程注册信号处理器，确保 shutdown_event 被设置
+    # （run_loop 在后台线程中无法注册信号处理器）
+    _original_sigint = signal.getsignal(signal.SIGINT)
+
+    def _shutdown_handler(signum, frame):
+        shutdown_event.set()
+        # 恢复原始处理器，让 uvicorn 正常关闭
+        signal.signal(signum, _original_sigint)
+        if callable(_original_sigint):
+            _original_sigint(signum, frame)
+
+    signal.signal(signal.SIGINT, _shutdown_handler)
 
     # 后台线程运行任务循环
     loop_thread = threading.Thread(

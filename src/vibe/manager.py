@@ -265,6 +265,7 @@ def _run_claude(
             stderr=subprocess.PIPE,
             cwd=proc_cwd,
             env=env,
+            start_new_session=True,  # 防止 SIGINT 传播到子进程
         )
     except FileNotFoundError:
         bin_name = "docker" if use_docker else "claude"
