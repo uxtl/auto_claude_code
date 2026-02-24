@@ -81,24 +81,34 @@ def _coerce(value: str, target_type: type, field_name: str = "") -> object | Non
 
 
 def load_config(workspace: Path | None = None) -> Config:
-    """加载配置: 默认值 → .env → 环境变量.
+    """加载配置: 默认值 → CWD/.env → workspace/.env → 环境变量.
 
     Args:
         workspace: 工作目录，用于查找 .env 文件
     """
     config = Config()
 
-    # 1. 从 .env 文件加载
     if workspace is None:
         workspace = Path.cwd()
-    dotenv = _parse_dotenv(workspace / ".env")
 
-    # 2. 合并 .env 和环境变量（环境变量优先）
+    # 1. CWD 的 .env（基础）
+    cwd = Path.cwd()
+    dotenv = _parse_dotenv(cwd / ".env")
+
+    # 2. workspace 的 .env（覆盖，如果 workspace != cwd）
+    ws_resolved = workspace.resolve()
+    if ws_resolved != cwd.resolve():
+        ws_dotenv = _parse_dotenv(ws_resolved / ".env")
+        dotenv.update(ws_dotenv)
+
+    # 3. 合并 .env 和环境变量（环境变量最终覆盖）
     for f in fields(Config):
-        env_key = _ENV_PREFIX + f.name.upper()
-        # 尝试从 .env 获取
-        raw = dotenv.get(env_key)
-        # 环境变量覆盖
+        env_key = _ENV_PREFIX + f.name.upper()  # e.g. "VIBE_PLAN_MODE"
+        bare_key = f.name.upper()                # e.g. "PLAN_MODE"
+        # .env: 无前缀 fallback，有前缀优先
+        raw = dotenv.get(bare_key)
+        raw = dotenv.get(env_key, raw)
+        # 环境变量覆盖（仍要求 VIBE_ 前缀，避免与其他工具冲突）
         raw = os.environ.get(env_key, raw)
         if raw is not None:
             coerced = _coerce(raw, f.type, f.name)
@@ -117,3 +127,18 @@ def load_config(workspace: Path | None = None) -> Config:
         config.max_workers = 1
 
     return config
+
+
+def log_active_config(config: Config) -> None:
+    """输出当前生效的关键配置值."""
+    logger.info(
+        "活跃配置: workspace=%s, max_workers=%d, plan_mode=%s, "
+        "plan_auto_approve=%s, use_docker=%s, use_worktree=%s, verbose=%s",
+        config.workspace,
+        config.max_workers,
+        config.plan_mode,
+        config.plan_auto_approve,
+        config.use_docker,
+        config.use_worktree,
+        config.verbose,
+    )
