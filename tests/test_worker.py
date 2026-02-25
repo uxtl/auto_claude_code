@@ -465,6 +465,108 @@ class TestMakeVerboseCallback:
         assert len(caplog.records) == 0
 
 
+class TestOnTaskSuccess:
+    """测试 on_task_success 合并回调."""
+
+    def test_merge_ok_completes(self, config: Config, workspace: Path, queue: TaskQueue):
+        """回调返回 True → 任务进入 done/."""
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+        callback = MagicMock(return_value=True)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result):
+            worker_loop("w0", config, queue, on_task_success=callback)
+
+        callback.assert_called_once_with("001_test", "w0")
+        done_files = list((workspace / "tasks" / "done").glob("*.md"))
+        assert len(done_files) == 1
+
+    def test_merge_fail_retries(self, workspace: Path):
+        """回调返回 False → 任务 fail → 重试."""
+        cfg = Config(workspace=str(workspace), max_retries=2)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+        callback = MagicMock(return_value=False)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result):
+            worker_loop("w0", cfg, q, on_task_success=callback)
+
+        # 2 retries: call 1 → fail(0→1) → requeue, call 2 → fail(1→2≥2) → exhausted
+        assert callback.call_count == 2
+        failed_files = list((workspace / "tasks" / "failed").glob("*.md"))
+        assert len(failed_files) == 1
+        content = failed_files[0].read_text(encoding="utf-8")
+        assert "合并冲突" in content
+
+    def test_merge_exception_as_fail(self, workspace: Path):
+        """回调抛异常 → 当作合并失败."""
+        cfg = Config(workspace=str(workspace), max_retries=1)
+        q = TaskQueue(cfg, workspace)
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+        callback = MagicMock(side_effect=RuntimeError("boom"))
+        with patch("vibe.worker.manager.run_task", return_value=mock_result):
+            worker_loop("w0", cfg, q, on_task_success=callback)
+
+        failed_files = list((workspace / "tasks" / "failed").glob("*.md"))
+        assert len(failed_files) == 1
+
+    def test_no_callback_backward_compat(self, config: Config, workspace: Path, queue: TaskQueue):
+        """无回调 → 正常完成（向后兼容）."""
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result):
+            worker_loop("w0", config, queue)  # no on_task_success
+
+        done_files = list((workspace / "tasks" / "done").glob("*.md"))
+        assert len(done_files) == 1
+
+
+class TestOnBeforeTask:
+    """测试 on_before_task 前置回调."""
+
+    def test_callback_called_before_task(self, config: Config, workspace: Path, queue: TaskQueue):
+        """回调在 run_task 前执行."""
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        call_order: list[str] = []
+
+        def before_cb(worker_id):
+            call_order.append("before")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+
+        original_run_task = None
+
+        def tracking_run_task(*args, **kwargs):
+            call_order.append("run_task")
+            return mock_result
+
+        with patch("vibe.worker.manager.run_task", side_effect=tracking_run_task):
+            worker_loop("w0", config, queue, on_before_task=before_cb)
+
+        assert call_order == ["before", "run_task"]
+
+    def test_callback_exception_continues(self, config: Config, workspace: Path, queue: TaskQueue):
+        """异常不阻断任务执行."""
+        (workspace / "tasks" / "001_test.md").write_text("content", encoding="utf-8")
+
+        def bad_cb(worker_id):
+            raise RuntimeError("sync failed")
+
+        mock_result = TaskResult(success=True, output="done", files_changed=[], duration_seconds=0.5)
+        with patch("vibe.worker.manager.run_task", return_value=mock_result) as mock_run:
+            worker_loop("w0", config, queue, on_before_task=bad_cb)
+
+        # 即使回调异常，任务仍然执行
+        mock_run.assert_called_once()
+        done_files = list((workspace / "tasks" / "done").glob("*.md"))
+        assert len(done_files) == 1
+
+
 class TestVerboseWiring:
     def test_verbose_true_passes_on_output(self, workspace: Path):
         """verbose=True → manager.run_task 收到非 None 的 on_output."""

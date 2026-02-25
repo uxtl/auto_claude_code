@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import logging
 import signal
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -13,9 +14,11 @@ from .config import Config
 from .manager import check_docker_available, ensure_docker_image
 from .task import TaskQueue
 from .worker import shutdown_event, worker_loop
+from .worker import update_worker_status
 from .worktree import (
+    MergeCoordinator,
+    MergeStatus,
     cleanup_stale_worktrees,
-    commit_and_merge,
     create_worktree,
     is_git_repo,
     remove_worktree,
@@ -29,6 +32,8 @@ def run_loop(
     approval_store: ApprovalStore | None = None,
     *,
     continuous: bool = False,
+    on_task_complete: Callable | None = None,
+    history: object | None = None,
 ) -> None:
     """主调度循环: 创建任务队列，启动 worker.
 
@@ -38,6 +43,7 @@ def run_loop(
     Args:
         continuous: 若为 True，处理完当前批次后不退出，等待 poll_interval 秒
                     后重新扫描新任务。适用于 serve 模式下持续运行。
+        on_task_complete: 可选回调，任务完成后调用 (task_name, worker_id, result)
     """
     workspace = Path(config.workspace).resolve()
     config.workspace = str(workspace)
@@ -119,11 +125,26 @@ def run_loop(
 
         if config.max_workers == 1:
             # 单 worker 快速路径，无线程开销，无需 worktree
-            worker_loop("w0", config, queue, approval_store=approval_store)
+            worker_loop(
+                "w0", config, queue,
+                approval_store=approval_store,
+                on_task_complete=on_task_complete,
+                history=history,
+            )
         elif use_wt:
-            _run_with_worktrees(config, queue, workspace, approval_store=approval_store)
+            _run_with_worktrees(
+                config, queue, workspace,
+                approval_store=approval_store,
+                on_task_complete=on_task_complete,
+                history=history,
+            )
         else:
-            _run_shared(config, queue, approval_store=approval_store)
+            _run_shared(
+                config, queue,
+                approval_store=approval_store,
+                on_task_complete=on_task_complete,
+                history=history,
+            )
 
         logger.info("=" * 60)
         logger.info("Vibe Loop 完成，所有任务已处理")
@@ -143,11 +164,17 @@ def _run_with_worktrees(
     queue: TaskQueue,
     workspace: Path,
     approval_store: ApprovalStore | None = None,
+    on_task_complete: Callable | None = None,
+    history: object | None = None,
 ) -> None:
-    """多 worker + git worktree 隔离模式."""
+    """多 worker + git worktree 隔离模式.
+
+    每个任务完成后立即 rebase + ff-merge（per-task merge），
+    而非等所有 worker 完成后批量合并。
+    """
     worktrees: dict[str, Path] = {}
 
-    # 为每个 worker 创建 worktree
+    # 1. 为每个 worker 创建 worktree
     for i in range(config.max_workers):
         wid = f"w{i}"
         try:
@@ -159,37 +186,74 @@ def _run_with_worktrees(
             for created_wid, created_path in worktrees.items():
                 remove_worktree(workspace, created_path)
             logger.warning("降级为共享 workspace 模式")
-            _run_shared(config, queue, approval_store=approval_store)
+            _run_shared(config, queue, approval_store=approval_store, on_task_complete=on_task_complete, history=history)
             return
 
-    # 启动 workers
-    with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
-        futures = {
-            pool.submit(
-                worker_loop, wid, config, queue, wt_path,
-                approval_store=approval_store,
-            ): wid
-            for wid, wt_path in worktrees.items()
-        }
-        for f in as_completed(futures):
-            f.result()  # 传播异常
+    # 2. 创建合并协调器（传入冲突解决配置）
+    coordinator = MergeCoordinator(
+        workspace,
+        resolve_conflicts=config.resolve_conflicts,
+        conflict_timeout=config.conflict_timeout,
+        use_docker=config.use_docker,
+        docker_image=config.docker_image,
+        docker_extra_args=config.docker_extra_args,
+        shutdown_event=shutdown_event,
+    )
 
-    # 逐个 merge worktree 的更改回主分支
-    for wid, wt_path in worktrees.items():
-        merged = commit_and_merge(workspace, wt_path, f"vibe: {wid} 任务完成")
-        if merged:
+    # 3. 构建每个 worker 的合并回调
+    def _make_merge_cb(wid: str, wt_path: Path) -> Callable[[str, str], bool]:
+        def cb(task_name: str, worker_id: str) -> bool:
+            update_worker_status(worker_id, phase="merging", task=task_name)
+            result = coordinator.merge_task(wt_path, task_name)
+            if result.status in (MergeStatus.SUCCESS, MergeStatus.NO_CHANGES):
+                return True
+            if result.status == MergeStatus.CONFLICT:
+                logger.warning(
+                    "[%s] 任务 %s 合并冲突，重置 worktree: %s",
+                    worker_id, task_name,
+                    result.conflict_files or "unknown files",
+                )
+                coordinator.refresh_worktree(wt_path)
+                return False
+            # ERROR
+            logger.error("[%s] 任务 %s 合并错误: %s", worker_id, task_name, result.message)
+            return False
+        return cb
+
+    # 4. 构建每个 worker 的 pre-task sync 回调
+    def _make_sync_cb(wt_path: Path) -> Callable[[str], None]:
+        def cb(worker_id: str) -> None:
+            coordinator.sync_worktree(wt_path)
+        return cb
+
+    # 5. 启动 workers（传入 on_task_success + on_before_task）
+    try:
+        with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
+            futures = {
+                pool.submit(
+                    worker_loop, wid, config, queue, wt_path,
+                    approval_store=approval_store,
+                    on_task_complete=on_task_complete,
+                    on_task_success=_make_merge_cb(wid, wt_path),
+                    on_before_task=_make_sync_cb(wt_path),
+                    history=history,
+                ): wid
+                for wid, wt_path in worktrees.items()
+            }
+            for f in as_completed(futures):
+                f.result()  # 传播异常
+    finally:
+        # 6. 无条件清理所有 worktrees（合并已在 per-task 回调中完成）
+        for wid, wt_path in worktrees.items():
             remove_worktree(workspace, wt_path)
-        else:
-            logger.warning(
-                "合并 %s 的 worktree 失败，保留 worktree 供手动处理: %s",
-                wid, wt_path,
-            )
 
 
 def _run_shared(
     config: Config,
     queue: TaskQueue,
     approval_store: ApprovalStore | None = None,
+    on_task_complete: Callable | None = None,
+    history: object | None = None,
 ) -> None:
     """多 worker 共享 workspace 模式（非 git repo 降级）."""
     with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
@@ -197,6 +261,8 @@ def _run_shared(
             pool.submit(
                 worker_loop, f"w{i}", config, queue,
                 approval_store=approval_store,
+                on_task_complete=on_task_complete,
+                history=history,
             )
             for i in range(config.max_workers)
         ]

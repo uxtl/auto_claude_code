@@ -4,17 +4,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vibe.config import Config
-from vibe.task import TaskQueue, _extract_retry_count, _set_retry_count, _MAX_TASK_FILE_SIZE, extract_error_context
+from vibe.task import (
+    TaskQueue,
+    _MAX_TASK_FILE_SIZE,
+    _make_slug,
+    _set_retry_count,
+    extract_dependencies,
+    extract_error_context,
+    extract_retry_count,
+    first_content_line,
+    next_task_number,
+)
 
 
 # ── retry count 辅助函数 ─────────────────────────────────────
 
 class TestRetryCount:
     def test_extract_none(self):
-        assert _extract_retry_count("normal content") == 0
+        assert extract_retry_count("normal content") == 0
 
     def test_extract(self):
-        assert _extract_retry_count("<!-- RETRY: 3 -->\ncontent") == 3
+        assert extract_retry_count("<!-- RETRY: 3 -->\ncontent") == 3
 
     def test_set_new(self):
         result = _set_retry_count("content", 1)
@@ -353,3 +363,170 @@ class TestRecover:
         assert not (task_dir / "001_test.md.running.w0").exists()
         # 原始 .md 文件保留
         assert (task_dir / "001_test.md").read_text(encoding="utf-8") == "original"
+
+
+# ── extract_dependencies ─────────────────────────────────────
+
+class TestExtractDependencies:
+    def test_no_deps(self):
+        assert extract_dependencies("normal content") == []
+
+    def test_single(self):
+        assert extract_dependencies("<!-- DEPENDS: 001 -->\ncontent") == [1]
+
+    def test_multiple(self):
+        assert extract_dependencies("<!-- DEPENDS: 001, 002, 003 -->\ncontent") == [1, 2, 3]
+
+    def test_whitespace_variants(self):
+        assert extract_dependencies("<!-- DEPENDS:  1 , 2 -->\ncontent") == [1, 2]
+
+    def test_with_retry(self):
+        content = "<!-- DEPENDS: 001 -->\n<!-- RETRY: 1 -->\ncontent"
+        assert extract_dependencies(content) == [1]
+
+
+# ── first_content_line ────────────────────────────────────────
+
+class TestFirstContentLine:
+    def test_simple(self):
+        assert first_content_line("hello world\n") == "hello world"
+
+    def test_skips_comments(self):
+        content = "<!-- DEPENDS: 001 -->\n<!-- RETRY: 1 -->\nreal content\n"
+        assert first_content_line(content) == "real content"
+
+    def test_empty(self):
+        assert first_content_line("") == ""
+
+    def test_only_comments(self):
+        assert first_content_line("<!-- comment -->\n") == ""
+
+    def test_truncate(self):
+        line = "x" * 200
+        assert len(first_content_line(line, max_len=120)) == 120
+
+    def test_skips_empty_lines(self):
+        content = "\n\n  \nhello\n"
+        assert first_content_line(content) == "hello"
+
+
+# ── next_task_number ──────────────────────────────────────────
+
+class TestNextTaskNumber:
+    def test_empty(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        done_dir = workspace / "tasks" / "done"
+        fail_dir = workspace / "tasks" / "failed"
+        assert next_task_number(task_dir, done_dir, fail_dir) == 1
+
+    def test_pending_only(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        (task_dir / "003_task.md").write_text("x", encoding="utf-8")
+        done_dir = workspace / "tasks" / "done"
+        fail_dir = workspace / "tasks" / "failed"
+        assert next_task_number(task_dir, done_dir, fail_dir) == 4
+
+    def test_running(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        (task_dir / "005_task.md.running.w0").write_text("x", encoding="utf-8")
+        done_dir = workspace / "tasks" / "done"
+        fail_dir = workspace / "tasks" / "failed"
+        assert next_task_number(task_dir, done_dir, fail_dir) == 6
+
+    def test_done(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        done_dir = workspace / "tasks" / "done"
+        fail_dir = workspace / "tasks" / "failed"
+        (done_dir / "20240101_120000_000000_007_old.md").write_text("x", encoding="utf-8")
+        assert next_task_number(task_dir, done_dir, fail_dir) == 8
+
+    def test_failed(self, workspace: Path):
+        task_dir = workspace / "tasks"
+        done_dir = workspace / "tasks" / "done"
+        fail_dir = workspace / "tasks" / "failed"
+        (fail_dir / "20240101_120000_000000_010_bad.md").write_text("x", encoding="utf-8")
+        assert next_task_number(task_dir, done_dir, fail_dir) == 11
+
+    def test_mixed(self, workspace: Path):
+        """最大编号来自 done，其余来源编号更小."""
+        task_dir = workspace / "tasks"
+        done_dir = workspace / "tasks" / "done"
+        fail_dir = workspace / "tasks" / "failed"
+        (task_dir / "001_pending.md").write_text("x", encoding="utf-8")
+        (task_dir / "002_run.md.running.w0").write_text("x", encoding="utf-8")
+        (done_dir / "20240101_120000_000000_005_done.md").write_text("x", encoding="utf-8")
+        (fail_dir / "20240101_120000_000000_003_fail.md").write_text("x", encoding="utf-8")
+        assert next_task_number(task_dir, done_dir, fail_dir) == 6
+
+
+# ── _make_slug ────────────────────────────────────────────────
+
+class TestMakeSlug:
+    def test_simple(self):
+        assert _make_slug("hello world") == "hello_world"
+
+    def test_cjk(self):
+        slug = _make_slug("分析代码库")
+        assert "分析代码库" in slug
+
+    def test_special_chars(self):
+        slug = _make_slug("foo/bar baz?qux")
+        assert "/" not in slug
+        assert "?" not in slug
+
+    def test_max_len(self):
+        slug = _make_slug("a" * 100, max_len=30)
+        assert len(slug) <= 30
+
+    def test_multiline_takes_first(self):
+        slug = _make_slug("first line\nsecond line")
+        assert "second" not in slug
+
+
+# ── claim_next 依赖 ──────────────────────────────────────────
+
+class TestClaimNextDependencies:
+    def test_skips_blocked_task(self, queue: TaskQueue, workspace: Path):
+        """依赖未满足的任务被跳过."""
+        (workspace / "tasks" / "001_first.md").write_text(
+            "<!-- DEPENDS: 999 -->\ntask 1", encoding="utf-8",
+        )
+        (workspace / "tasks" / "002_second.md").write_text("task 2", encoding="utf-8")
+
+        task = queue.claim_next("w0")
+        assert task is not None
+        assert task.name == "002_second"
+
+    def test_claims_when_dep_done(self, queue: TaskQueue, workspace: Path):
+        """依赖已完成时可认领."""
+        (workspace / "tasks" / "done" / "20240101_120000_000000_001_first.md").write_text(
+            "done", encoding="utf-8",
+        )
+        (workspace / "tasks" / "002_second.md").write_text(
+            "<!-- DEPENDS: 001 -->\ntask 2", encoding="utf-8",
+        )
+
+        task = queue.claim_next("w0")
+        assert task is not None
+        assert task.name == "002_second"
+        assert task.depends_on == [1]
+
+    def test_all_blocked_returns_none(self, queue: TaskQueue, workspace: Path):
+        """所有任务都被依赖阻塞时返回 None."""
+        (workspace / "tasks" / "001_a.md").write_text(
+            "<!-- DEPENDS: 999 -->\ntask a", encoding="utf-8",
+        )
+        (workspace / "tasks" / "002_b.md").write_text(
+            "<!-- DEPENDS: 998 -->\ntask b", encoding="utf-8",
+        )
+
+        task = queue.claim_next("w0")
+        assert task is None
+
+    def test_no_deps_field_when_empty(self, queue: TaskQueue, workspace: Path):
+        """无依赖的任务 depends_on 为 None."""
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        task = queue.claim_next("w0")
+        assert task is not None
+        assert task.depends_on is None

@@ -5,9 +5,9 @@ import logging
 import sys
 from pathlib import Path
 
-from .config import load_config
+from .config import load_config, log_active_config
 from .loop import run_loop
-from .task import TaskQueue
+from .task import TaskQueue, next_task_number, _make_slug
 
 
 def _setup_logging(config) -> None:
@@ -47,6 +47,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         )
         config.plan_auto_approve = True
     _setup_logging(config)
+    log_active_config(config)
     run_loop(config)
 
 
@@ -57,6 +58,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
         config.workspace = args.workspace
     if args.workers is not None:
         config.max_workers = args.workers
+    if args.no_worktree:
+        config.use_worktree = False
+    if args.plan_mode:
+        config.plan_mode = True
     if args.docker:
         config.use_docker = True
     if args.docker_image:
@@ -64,6 +69,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     if args.verbose:
         config.verbose = True
     _setup_logging(config)
+    log_active_config(config)
 
     from .server import start_server
     start_server(config, host=args.host, port=args.port)
@@ -115,28 +121,26 @@ def cmd_add(args: argparse.Namespace) -> None:
         config.workspace = args.workspace
     workspace = Path(config.workspace).resolve()
     task_dir = workspace / config.task_dir
+    done_dir = workspace / config.done_dir
+    fail_dir = workspace / config.fail_dir
     task_dir.mkdir(parents=True, exist_ok=True)
 
-    # 自动编号
-    existing = sorted(task_dir.glob("*.md"))
-    if existing:
-        # 提取最大编号
-        max_num = 0
-        for f in existing:
-            parts = f.stem.split("_", 1)
-            try:
-                max_num = max(max_num, int(parts[0]))
-            except ValueError:
-                pass
-        next_num = max_num + 1
-    else:
-        next_num = 1
+    # 自动编号（扫描 pending + running + done + failed）
+    next_num = next_task_number(task_dir, done_dir, fail_dir)
 
     # 生成文件名
-    slug = args.description[:30].replace(" ", "_").replace("/", "_")
+    slug = _make_slug(args.description)
     filename = f"{next_num:03d}_{slug}.md"
     task_file = task_dir / filename
-    task_file.write_text(args.description + "\n", encoding="utf-8")
+
+    # 构建任务内容
+    content = ""
+    if args.after:
+        dep_nums = [s.strip() for s in args.after.split(",")]
+        content += f"<!-- DEPENDS: {', '.join(dep_nums)} -->\n"
+    content += args.description + "\n"
+
+    task_file.write_text(content, encoding="utf-8")
     print(f"已添加任务: {filename}")
 
 
@@ -198,6 +202,8 @@ def main() -> None:
     p_serve = subparsers.add_parser("serve", help="启动 Web 管理界面")
     p_serve.add_argument("--workspace", "-w", help="工作目录（目标项目）")
     p_serve.add_argument("--workers", "-n", type=int, help="并行 worker 数量")
+    p_serve.add_argument("--no-worktree", action="store_true", help="禁用 git worktree 隔离")
+    p_serve.add_argument("--plan-mode", action="store_true", help="启用 Plan 模式（先生成计划再执行）")
     p_serve.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
     p_serve.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
     p_serve.add_argument("--docker", action="store_true", help="启用 Docker 隔离模式")
@@ -214,6 +220,11 @@ def main() -> None:
     p_add = subparsers.add_parser("add", help="快速添加任务")
     p_add.add_argument("description", help="任务描述")
     p_add.add_argument("--workspace", "-w", help="工作目录")
+    p_add.add_argument(
+        "--after", "--depends",
+        default=None,
+        help="依赖的任务编号（逗号分隔），如 --after 001,002",
+    )
     p_add.set_defaults(func=cmd_add)
 
     # recover

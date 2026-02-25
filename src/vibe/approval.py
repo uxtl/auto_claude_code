@@ -23,13 +23,17 @@ class PendingApproval:
     plan_text: str
     created_at: datetime = field(default_factory=datetime.now)
     decision: ApprovalDecision = ApprovalDecision.PENDING
+    feedback: str = ""
+    selections: dict = field(default_factory=dict)
     _event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def wait(self, timeout: float | None = None) -> bool:
         """阻塞直到被 approve/reject，返回 event 是否被 set."""
         return self._event.wait(timeout=timeout)
 
-    def approve(self) -> None:
+    def approve(self, feedback: str = "", selections: dict | None = None) -> None:
+        self.feedback = feedback
+        self.selections = selections or {}
         self.decision = ApprovalDecision.APPROVED
         self._event.set()
 
@@ -68,12 +72,12 @@ class ApprovalStore:
                 if item.decision == ApprovalDecision.PENDING
             ]
 
-    def approve(self, approval_id: str) -> bool:
+    def approve(self, approval_id: str, feedback: str = "", selections: dict | None = None) -> bool:
         with self._lock:
             item = self._items.get(approval_id)
             if item is None:
                 return False
-            item.approve()
+            item.approve(feedback=feedback, selections=selections or {})
             return True
 
     def reject(self, approval_id: str) -> bool:

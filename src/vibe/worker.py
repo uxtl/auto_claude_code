@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time as _time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -12,8 +13,28 @@ from . import manager
 from .analyzer import analyze_execution
 from .approval import ApprovalStore
 from .config import Config
+from .history import ExecutionHistory
 from .manager import TaskResult
 from .task import Task, TaskQueue, extract_error_context
+
+# ── Worker 状态追踪 ────────────────────────────────────────
+
+_worker_status: dict[str, dict] = {}
+_worker_status_lock = threading.Lock()
+
+
+def update_worker_status(worker_id: str, **kwargs: object) -> None:
+    """更新指定 worker 的状态."""
+    with _worker_status_lock:
+        if worker_id not in _worker_status:
+            _worker_status[worker_id] = {"worker_id": worker_id, "phase": "idle"}
+        _worker_status[worker_id].update(kwargs)
+
+
+def get_all_worker_status() -> dict[str, dict]:
+    """获取所有 worker 的实时状态快照."""
+    with _worker_status_lock:
+        return {k: dict(v) for k, v in _worker_status.items()}
 
 PROMPT_PREFIX = (
     "## 执行前准备\n"
@@ -37,11 +58,12 @@ PROMPT_SUFFIX = (
 shutdown_event = threading.Event()
 
 
-def build_prompt(task: Task | str) -> str:
+def build_prompt(task: Task | str, dep_context: str = "") -> str:
     """构建完整的 prompt：注入读取 PROGRESS.md 和更新 PROGRESS.md 的指令.
 
     重试时注入错误上下文，帮助 Claude Code 避免重复同样的错误。
     接受 Task 对象或纯字符串（向后兼容）。
+    dep_context: 可选的前置任务执行结果，注入到 prompt 中。
     """
     if isinstance(task, str):
         return PROMPT_PREFIX + task + PROMPT_SUFFIX
@@ -49,7 +71,10 @@ def build_prompt(task: Task | str) -> str:
     if task.retries > 0:
         errors, diagnostics, clean_content = extract_error_context(task.content)
         if errors or diagnostics:
-            sections = PROMPT_PREFIX + clean_content + "\n\n## 上次执行失败信息\n\n"
+            sections = PROMPT_PREFIX + clean_content
+            if dep_context:
+                sections += "\n\n" + dep_context
+            sections += "\n\n## 上次执行失败信息\n\n"
             sections += f"这是第 {task.retries + 1} 次尝试。"
             if errors:
                 error_block = "\n".join(f"- {e}" for e in errors)
@@ -58,9 +83,42 @@ def build_prompt(task: Task | str) -> str:
                 sections += f"\n### 执行诊断\n\n{diagnostics[-1]}\n"
             sections += "请特别注意避免同样的错误。\n"
             return sections + PROMPT_SUFFIX
-    return PROMPT_PREFIX + task.content + PROMPT_SUFFIX
+
+    body = PROMPT_PREFIX + task.content
+    if dep_context:
+        body += "\n\n" + dep_context
+    return body + PROMPT_SUFFIX
 
 logger = logging.getLogger(__name__)
+
+
+def _build_dep_context(task: Task, history: ExecutionHistory | None) -> str:
+    """构建前置任务执行结果上下文.
+
+    当任务有 depends_on 且 history 可用时，查询前置任务的 result_text 并拼接。
+    """
+    if not task.depends_on or history is None:
+        return ""
+    sections: list[str] = []
+    for dep_num in task.depends_on:
+        dep_prefix = f"{dep_num:03d}_"
+        records = []
+        # 查找匹配的执行记录（任务名以编号开头）
+        recent = history.list_recent(limit=200)
+        for rec in recent:
+            if rec.get("task_name", "").startswith(dep_prefix) and rec.get("success"):
+                records.append(rec)
+                break
+        if records:
+            rec = records[0]
+            result_text = rec.get("result_text", "")
+            if result_text:
+                sections.append(
+                    f"### 任务 #{dep_num:03d} ({rec['task_name']}) 执行结果\n\n{result_text}"
+                )
+    if not sections:
+        return ""
+    return "## 前置任务执行结果\n\n" + "\n\n".join(sections)
 
 
 def _docker_kwargs(config: Config) -> dict:
@@ -139,6 +197,10 @@ def worker_loop(
     queue: TaskQueue,
     worktree: Path | None = None,
     approval_store: ApprovalStore | None = None,
+    on_task_complete: Callable[[str, str, TaskResult], None] | None = None,
+    on_task_success: Callable[[str, str], bool] | None = None,
+    on_before_task: Callable[[str], None] | None = None,
+    history: ExecutionHistory | None = None,
 ) -> None:
     """单个 worker 的执行循环: 不断认领任务直到队列为空.
 
@@ -148,19 +210,43 @@ def worker_loop(
         queue: 线程安全的任务队列
         worktree: 可选的 git worktree 路径，为 None 时使用 config.workspace
         approval_store: 可选的审批存储，plan_mode + 非 auto_approve 时使用
+        on_task_complete: 可选回调，任务完成后调用 (task_name, worker_id, result)
+        on_task_success: 可选回调，任务成功后合并前调用 (task_name, worker_id) -> merge_ok
+        on_before_task: 可选回调，任务执行前调用 (worker_id)，用于 pre-task sync
+        history: 可选的执行历史，用于注入前置任务结果到 prompt
     """
     cwd = str(worktree) if worktree else config.workspace
+    update_worker_status(worker_id, phase="idle", task=None, cwd=cwd)
     logger.info("[%s] Worker 启动, cwd=%s", worker_id, cwd)
 
     while not shutdown_event.is_set():
         task = queue.claim_next(worker_id)
         if task is None:
+            update_worker_status(worker_id, phase="idle", task=None)
             logger.info("[%s] 队列为空，Worker 退出", worker_id)
             return
 
         logger.info("[%s] 认领任务: %s", worker_id, task.name)
-        _execute_task(worker_id, config, queue, task, cwd, approval_store)
+        update_worker_status(
+            worker_id, phase="claimed", task=task.name,
+            started_at=_time.time(),
+        )
 
+        if on_before_task is not None:
+            update_worker_status(worker_id, phase="syncing", task=task.name)
+            try:
+                on_before_task(worker_id)
+            except Exception:
+                logger.exception("[%s] on_before_task 回调异常", worker_id)
+
+        _execute_task(
+            worker_id, config, queue, task, cwd, approval_store,
+            on_task_complete=on_task_complete,
+            on_task_success=on_task_success,
+            history=history,
+        )
+
+    update_worker_status(worker_id, phase="idle", task=None)
     logger.info("[%s] 收到关闭信号，Worker 退出", worker_id)
 
 
@@ -171,9 +257,13 @@ def _execute_task(
     task: Task,
     cwd: str,
     approval_store: ApprovalStore | None = None,
+    on_task_complete: Callable[[str, str, TaskResult], None] | None = None,
+    on_task_success: Callable[[str, str], bool] | None = None,
+    history: ExecutionHistory | None = None,
 ) -> None:
     """执行单个任务并处理结果."""
-    prompt = build_prompt(task)
+    dep_context = _build_dep_context(task, history)
+    prompt = build_prompt(task, dep_context=dep_context)
     docker_kw = _docker_kwargs(config)
     on_output = _make_verbose_callback(worker_id) if config.verbose else None
 
@@ -182,6 +272,7 @@ def _execute_task(
         and not config.plan_auto_approve
         and approval_store is not None
     ):
+        update_worker_status(worker_id, phase="planning")
         result = _execute_with_approval(
             worker_id, prompt, cwd, config.timeout, task.name, approval_store,
             shutdown_event=shutdown_event,
@@ -189,11 +280,13 @@ def _execute_task(
             **docker_kw,
         )
     elif config.plan_mode:
+        update_worker_status(worker_id, phase="planning")
         result = manager.run_plan(
             prompt, cwd=cwd, timeout=config.timeout,
             shutdown_event=shutdown_event, on_output=on_output, **docker_kw,
         )
     else:
+        update_worker_status(worker_id, phase="executing")
         result = manager.run_task(
             prompt, cwd=cwd, timeout=config.timeout,
             shutdown_event=shutdown_event, on_output=on_output, **docker_kw,
@@ -206,14 +299,31 @@ def _execute_task(
         return
 
     if result.success:
-        logger.info(
-            "[%s] 任务成功: %s (%.1fs, %d 文件变更)",
-            worker_id,
-            task.name,
-            result.duration_seconds,
-            len(result.files_changed),
-        )
-        queue.complete(task)
+        merge_ok = True
+        if on_task_success is not None:
+            update_worker_status(worker_id, phase="merging", task=task.name)
+            try:
+                merge_ok = on_task_success(task.name, worker_id)
+            except Exception:
+                logger.exception("[%s] on_task_success 回调异常", worker_id)
+                merge_ok = False
+
+        if merge_ok:
+            logger.info(
+                "[%s] 任务成功: %s (%.1fs, %d 文件变更)",
+                worker_id,
+                task.name,
+                result.duration_seconds,
+                len(result.files_changed),
+            )
+            queue.complete(task)
+        else:
+            logger.warning(
+                "[%s] 任务执行成功但合并失败，重试: %s",
+                worker_id,
+                task.name,
+            )
+            queue.fail(task, "合并冲突，需要重试")
     else:
         logger.error(
             "[%s] 任务失败: %s — %s",
@@ -223,6 +333,15 @@ def _execute_task(
         )
         diagnostics = analyze_execution(result)
         queue.fail(task, result.error, diagnostics=diagnostics)
+
+    # 回调通知执行完成
+    if on_task_complete is not None:
+        try:
+            on_task_complete(task.name, worker_id, result)
+        except Exception:
+            logger.exception("on_task_complete 回调异常")
+
+    update_worker_status(worker_id, phase="idle", task=None)
 
 
 def _execute_with_approval(
@@ -261,6 +380,7 @@ def _execute_with_approval(
     plan_text = plan_result.output
 
     # Step 2: 提交审批并等待
+    update_worker_status(worker_id, phase="awaiting_approval")
     logger.info("[%s] 计划已生成，等待人工审批: %s", worker_id, task_name)
     approval = approval_store.submit(task_name, worker_id, plan_text)
 
@@ -283,7 +403,19 @@ def _execute_with_approval(
         logger.info("[%s] 计划被拒绝: %s", worker_id, task_name)
         return TaskResult(success=False, error="用户拒绝计划")
 
-    # Step 3: 执行计划
+    # Step 3: 注入用户反馈到 plan_text
+    if approval.feedback or approval.selections:
+        feedback_section = "\n\n## 用户反馈\n"
+        if approval.feedback:
+            feedback_section += f"\n{approval.feedback}\n"
+        if approval.selections:
+            feedback_section += "\n### 用户选择\n"
+            for key, val in approval.selections.items():
+                feedback_section += f"- {key}: {val}\n"
+        plan_text = plan_text + feedback_section
+
+    # Step 4: 执行计划
+    update_worker_status(worker_id, phase="executing")
     logger.info("[%s] 计划已批准，开始执行: %s", worker_id, task_name)
     remaining_timeout = timeout - int(time.monotonic() - start_time)
     if remaining_timeout < 60:

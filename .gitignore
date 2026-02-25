@@ -18,3 +18,11 @@ dist/
 
 # Vibe worktrees
 .vibe-worktrees/
+
+# Frontend
+src/vibe/frontend/node_modules/
+src/vibe/frontend/dist/
+src/vibe/static/
+
+# SQLite history
+*.vibe_history.db

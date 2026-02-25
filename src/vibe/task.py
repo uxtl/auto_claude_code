@@ -14,9 +14,13 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 _RETRY_PATTERN = re.compile(r"<!--\s*RETRY:\s*(\d+)\s*-->")
+_DEPENDS_PATTERN = re.compile(r"<!--\s*DEPENDS:\s*([\d,\s]+)\s*-->")
 _ERROR_PATTERN = re.compile(r"<!--\s*Error:\s*(.*?)\s*-->")
+_TS_PREFIX = re.compile(r"^\d{8}_\d{6}(_\d{6})?_")
+_NUM_PREFIX = re.compile(r"^(\d+)")
 _COMMENT_PREFIXES = (
     "<!-- RETRY:",
+    "<!-- DEPENDS:",
     "<!-- FAILED",
     "<!-- FINAL FAILURE",
     "<!-- Error:",
@@ -33,6 +37,7 @@ class Task:
     name: str
     content: str
     retries: int = 0
+    depends_on: list[int] | None = None
 
 
 class TaskQueue:
@@ -54,13 +59,46 @@ class TaskQueue:
         self._fail_dir.mkdir(parents=True, exist_ok=True)
 
     def claim_next(self, worker_id: str) -> Task | None:
-        """原子性地认领下一个任务: rename task.md → task.md.running.{worker_id}."""
+        """原子性地认领下一个任务: rename task.md → task.md.running.{worker_id}.
+
+        依赖感知: 检查每个 pending 任务的 DEPENDS 注释，仅认领依赖全部完成的任务。
+        """
         with self._lock:
             pending = sorted(self._task_dir.glob("*.md"))
             if not pending:
                 return None
 
-            task_file = pending[0]
+            done_nums = self._get_done_numbers()
+
+            task_file: Path | None = None
+            content: str = ""
+            for candidate in pending:
+                try:
+                    file_size = candidate.stat().st_size
+                except OSError:
+                    continue
+                if file_size > _MAX_TASK_FILE_SIZE:
+                    logger.error(
+                        "任务文件 %s 过大 (%d bytes > %d)，跳过",
+                        candidate.name, file_size, _MAX_TASK_FILE_SIZE,
+                    )
+                    continue
+                raw = candidate.read_text(encoding="utf-8")
+                deps = extract_dependencies(raw)
+                if deps:
+                    unmet = [d for d in deps if d not in done_nums]
+                    if unmet:
+                        logger.debug(
+                            "任务 %s 依赖未满足 %s，跳过", candidate.name, unmet,
+                        )
+                        continue
+                task_file = candidate
+                content = raw
+                break
+
+            if task_file is None:
+                return None
+
             running_name = f"{task_file.name}.running.{worker_id}"
             running_path = self._task_dir / running_name
 
@@ -70,26 +108,40 @@ class TaskQueue:
                 logger.warning("认领任务 %s 失败: %s", task_file.name, e)
                 return None
 
-        # 读取内容（在锁外完成，减少持锁时间）
-        try:
-            file_size = running_path.stat().st_size
-        except OSError:
-            file_size = 0
-        if file_size > _MAX_TASK_FILE_SIZE:
-            logger.error(
-                "任务文件 %s 过大 (%d bytes > %d)，跳过",
-                running_path.name, file_size, _MAX_TASK_FILE_SIZE,
-            )
-            return None
-        content = running_path.read_text(encoding="utf-8")
-        retries = _extract_retry_count(content)
+        retries = extract_retry_count(content)
+        deps = extract_dependencies(content)
 
         return Task(
             path=running_path,
             name=task_file.stem,
             content=content,
             retries=retries,
+            depends_on=deps if deps else None,
         )
+
+    def _get_done_numbers(self) -> set[int]:
+        """返回 done/ 目录中所有任务的编号集合."""
+        nums: set[int] = set()
+        if not self._done_dir.is_dir():
+            return nums
+        for f in self._done_dir.glob("*.md"):
+            name = _TS_PREFIX.sub("", f.stem)
+            m = _NUM_PREFIX.match(name)
+            if m:
+                nums.add(int(m.group(1)))
+        return nums
+
+    def _get_failed_numbers(self) -> set[int]:
+        """返回 failed/ 目录中所有任务的编号集合."""
+        nums: set[int] = set()
+        if not self._fail_dir.is_dir():
+            return nums
+        for f in self._fail_dir.glob("*.md"):
+            name = _TS_PREFIX.sub("", f.stem)
+            m = _NUM_PREFIX.match(name)
+            if m:
+                nums.add(int(m.group(1)))
+        return nums
 
     def release(self, task: Task) -> None:
         """释放任务回队列: 将 .running.{worker_id} 重命名回 .md."""
@@ -177,13 +229,11 @@ class TaskQueue:
         if not fail_dir.is_dir():
             return []
 
-        _ts_prefix = re.compile(r"^\d{8}_\d{6}(_\d{6})?_")
-
         # 查找匹配的失败任务
         if name is not None:
             matches = [
                 f for f in fail_dir.glob("*.md")
-                if f.stem == name or _ts_prefix.sub("", f.stem) == name
+                if f.stem == name or _TS_PREFIX.sub("", f.stem) == name
             ]
         else:
             matches = sorted(fail_dir.glob("*.md"))
@@ -193,7 +243,7 @@ class TaskQueue:
             content = src.read_text(encoding="utf-8")
             _, _, clean_content = extract_error_context(content)
 
-            dest_name = _ts_prefix.sub("", src.name)
+            dest_name = _TS_PREFIX.sub("", src.name)
             dest = task_dir / dest_name
             dest.write_text(clean_content, encoding="utf-8")
             src.unlink()
@@ -249,7 +299,7 @@ def _atomic_write(dest: Path, content: str) -> None:
         raise
 
 
-def _extract_retry_count(content: str) -> int:
+def extract_retry_count(content: str) -> int:
     """从任务内容中提取重试次数."""
     match = _RETRY_PATTERN.search(content)
     return int(match.group(1)) if match else 0
@@ -303,6 +353,98 @@ def extract_error_context(content: str) -> tuple[list[str], list[str], str]:
 
     clean_content = "\n".join(clean_lines).strip() + "\n" if clean_lines else ""
     return errors, diagnostics, clean_content
+
+
+def extract_dependencies(content: str) -> list[int]:
+    """从任务内容中提取依赖列表.
+
+    解析 ``<!-- DEPENDS: 001, 002 -->`` 注释，返回依赖的任务编号列表。
+    """
+    match = _DEPENDS_PATTERN.search(content)
+    if not match:
+        return []
+    raw = match.group(1)
+    nums: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            nums.append(int(part))
+    return nums
+
+
+def first_content_line(content: str, max_len: int = 120) -> str:
+    """从任务内容中提取第一个非注释行作为描述.
+
+    跳过 HTML 注释行，返回第一个实际内容行（截断到 max_len）。
+    """
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("<!--") and stripped.endswith("-->"):
+            continue
+        if stripped.startswith("<!--"):
+            # 多行注释开始，跳过
+            continue
+        if stripped.endswith("-->"):
+            # 多行注释结束，跳过
+            continue
+        return stripped[:max_len]
+    return ""
+
+
+def next_task_number(
+    task_dir: Path,
+    done_dir: Path,
+    fail_dir: Path,
+) -> int:
+    """扫描所有任务来源，返回下一个可用编号.
+
+    扫描 4 个来源: pending (*.md), running (*.md.running.*), done/, failed/。
+    """
+    max_num = 0
+
+    def _extract_num(name: str) -> int:
+        """从文件名（stem 或去时间戳后）中提取编号前缀."""
+        m = _NUM_PREFIX.match(name)
+        return int(m.group(1)) if m else 0
+
+    # pending
+    for f in task_dir.glob("*.md"):
+        if ".running." not in f.name:
+            max_num = max(max_num, _extract_num(f.stem))
+
+    # running
+    for f in task_dir.glob("*.md.running.*"):
+        base = f.name.split(".running.")[0].replace(".md", "")
+        max_num = max(max_num, _extract_num(base))
+
+    # done
+    if done_dir.is_dir():
+        for f in done_dir.glob("*.md"):
+            name = _TS_PREFIX.sub("", f.stem)
+            max_num = max(max_num, _extract_num(name))
+
+    # failed
+    if fail_dir.is_dir():
+        for f in fail_dir.glob("*.md"):
+            name = _TS_PREFIX.sub("", f.stem)
+            max_num = max(max_num, _extract_num(name))
+
+    return max_num + 1
+
+
+def _make_slug(description: str, max_len: int = 60) -> str:
+    """从描述生成文件名 slug.
+
+    取第一行，允许 CJK 和字母数字字符，将其余字符替换为 '_'。
+    """
+    first_line = description.split("\n", 1)[0].strip()
+    # 允许 Unicode 字母/数字/下划线，替换其余字符
+    slug = re.sub(r"[^\w]", "_", first_line, flags=re.UNICODE)
+    # 合并连续下划线，去除首尾下划线
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug[:max_len]
 
 
 def _set_retry_count(content: str, count: int) -> str:

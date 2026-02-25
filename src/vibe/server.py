@@ -11,12 +11,23 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from .approval import ApprovalStore
 from .config import Config, load_config
+from .history import ExecutionHistory
 from .loop import run_loop
-from .task import TaskQueue
+from .task import (
+    TaskQueue,
+    _make_slug,
+    extract_dependencies,
+    extract_error_context,
+    extract_retry_count,
+    first_content_line,
+    next_task_number,
+)
+from .worker import get_all_worker_status
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +63,7 @@ def _install_log_handler() -> None:
 def create_app(
     config: Config | None = None,
     approval_store: ApprovalStore | None = None,
+    history: ExecutionHistory | None = None,
 ) -> FastAPI:
     """创建 FastAPI 应用实例."""
     if config is None:
@@ -76,21 +88,50 @@ def create_app(
         _loop = None
         _log_event = None
 
-    app = FastAPI(title="Vibe Manager", version="0.2.0", lifespan=_lifespan)
+    app = FastAPI(title="Vibe Manager", version="0.3.0", lifespan=_lifespan)
 
     # ── 任务列表 ─────────────────────────────────────────────
 
     def _scan_tasks() -> list[dict]:
-        """扫描文件系统，返回所有任务的状态."""
+        """扫描文件系统，返回所有任务的状态（含描述、依赖信息）."""
         task_dir = workspace / config.task_dir
         done_dir = workspace / config.done_dir
         fail_dir = workspace / config.fail_dir
         tasks = []
 
+        # 预先收集 done 编号，用于判断依赖是否满足
+        done_nums: set[int] = set()
+        if done_dir.is_dir():
+            for f in done_dir.glob("*.md"):
+                name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem)
+                m = re.match(r"^(\d+)", name)
+                if m:
+                    done_nums.add(int(m.group(1)))
+
+        failed_nums: set[int] = set()
+        if fail_dir.is_dir():
+            for f in fail_dir.glob("*.md"):
+                name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem)
+                m = re.match(r"^(\d+)", name)
+                if m:
+                    failed_nums.add(int(m.group(1)))
+
         # pending
         for f in sorted(task_dir.glob("*.md")):
             if ".running." not in f.name:
-                tasks.append({"name": f.stem, "status": "pending", "file": f.name})
+                content = f.read_text(encoding="utf-8")
+                deps = extract_dependencies(content)
+                desc = first_content_line(content)
+                unmet = [d for d in deps if d not in done_nums] if deps else []
+                entry: dict = {
+                    "name": f.stem, "status": "pending", "file": f.name,
+                    "description": desc,
+                }
+                if deps:
+                    entry["depends"] = deps
+                    entry["blocked"] = bool(unmet)
+                    entry["unmet_deps"] = unmet
+                tasks.append(entry)
 
         # running
         for f in sorted(task_dir.glob("*.md.running.*")):
@@ -105,7 +146,6 @@ def create_app(
         # done
         if done_dir.is_dir():
             for f in sorted(done_dir.glob("*.md")):
-                # 文件名格式: 20240101_120000_taskname.md
                 name = re.sub(r"^\d{8}_\d{6}(_\d{6})?_", "", f.stem)
                 tasks.append({"name": name, "status": "done", "file": f.name})
 
@@ -130,24 +170,25 @@ def create_app(
         if not description:
             return JSONResponse({"error": "description 不能为空"}, status_code=400)
 
+        depends: list[int] = body.get("depends", [])
+
         task_dir = workspace / config.task_dir
+        done_dir = workspace / config.done_dir
+        fail_dir = workspace / config.fail_dir
         task_dir.mkdir(parents=True, exist_ok=True)
 
         with _task_num_lock:
-            # 自动编号
-            existing = sorted(task_dir.glob("*.md"))
-            max_num = 0
-            for f in existing:
-                parts = f.stem.split("_", 1)
-                try:
-                    max_num = max(max_num, int(parts[0]))
-                except ValueError:
-                    pass
-            next_num = max_num + 1
-
-            slug = description[:30].replace(" ", "_").replace("/", "_")
+            next_num = next_task_number(task_dir, done_dir, fail_dir)
+            slug = _make_slug(description)
             filename = f"{next_num:03d}_{slug}.md"
-            (task_dir / filename).write_text(description + "\n", encoding="utf-8")
+
+            content = ""
+            if depends:
+                dep_strs = [str(d).zfill(3) for d in depends]
+                content += f"<!-- DEPENDS: {', '.join(dep_strs)} -->\n"
+            content += description + "\n"
+
+            (task_dir / filename).write_text(content, encoding="utf-8")
         logger.info("通过 Web 添加任务: %s", filename)
         return JSONResponse({"filename": filename, "number": next_num}, status_code=201)
 
@@ -162,6 +203,26 @@ def create_app(
         if not retried:
             return JSONResponse({"error": f"未找到失败任务: {name}"}, status_code=404)
         return JSONResponse({"retried": retried[0]})
+
+    # ── 强制运行（移除依赖限制）─────────────────────────────
+
+    @app.post("/api/tasks/{name}/force-run")
+    async def force_run_task(name: str) -> JSONResponse:
+        """移除任务的 DEPENDS 注释，使其可被立即认领."""
+        task_dir = workspace / config.task_dir
+        for f in sorted(task_dir.glob("*.md")):
+            if ".running." in f.name:
+                continue
+            if f.stem == name:
+                content = f.read_text(encoding="utf-8")
+                from .task import _DEPENDS_PATTERN
+                new_content = _DEPENDS_PATTERN.sub("", content).lstrip("\n")
+                if not new_content.endswith("\n"):
+                    new_content += "\n"
+                f.write_text(new_content, encoding="utf-8")
+                logger.info("强制运行任务（移除依赖）: %s", f.name)
+                return JSONResponse({"forced": f.name})
+        return JSONResponse({"error": f"未找到 pending 任务: {name}"}, status_code=404)
 
     # ── 删除任务 ─────────────────────────────────────────────
 
@@ -179,6 +240,99 @@ def create_app(
                 logger.info("删除任务: %s", matches[0].name)
                 return JSONResponse({"deleted": matches[0].name})
         return JSONResponse({"error": f"未找到任务: {name}"}, status_code=404)
+
+    # ── 任务内容详情 ──────────────────────────────────────────
+
+    @app.get("/api/tasks/{name}/content")
+    async def get_task_content(name: str) -> JSONResponse:
+        """读取任务文件内容 + 解析元数据."""
+        task_dir = workspace / config.task_dir
+        done_dir = workspace / config.done_dir
+        fail_dir = workspace / config.fail_dir
+        _ts_re = re.compile(r"^\d{8}_\d{6}(_\d{6})?_")
+
+        # 搜索所有目录
+        search = [
+            (task_dir, "*.md", "pending"),
+            (task_dir, "*.md.running.*", "running"),
+            (done_dir, "*.md", "done"),
+            (fail_dir, "*.md", "failed"),
+        ]
+        for search_dir, pattern, status in search:
+            if not search_dir.is_dir():
+                continue
+            for f in search_dir.glob(pattern):
+                # 提取基本名称
+                fname = f.name.split(".running.")[0].replace(".md", "") if ".running." in f.name else f.stem
+                clean_name = _ts_re.sub("", fname)
+                if fname == name or clean_name == name:
+                    content = f.read_text(encoding="utf-8")
+                    errors, diagnostics, clean_content = extract_error_context(content)
+                    retry_count = extract_retry_count(content)
+                    try:
+                        modified_at = f.stat().st_mtime
+                    except OSError:
+                        modified_at = 0.0
+                    return JSONResponse({
+                        "name": name,
+                        "status": status,
+                        "raw_content": content,
+                        "clean_content": clean_content,
+                        "errors": errors,
+                        "diagnostics": diagnostics,
+                        "retry_count": retry_count,
+                        "file": f.name,
+                        "modified_at": modified_at,
+                    })
+
+        return JSONResponse({"error": f"未找到任务: {name}"}, status_code=404)
+
+    # ── 编辑任务内容 ──────────────────────────────────────────
+
+    @app.put("/api/tasks/{name}/content")
+    async def update_task_content(name: str, request: Request) -> JSONResponse:
+        """编辑 pending 任务的内容."""
+        task_dir = workspace / config.task_dir
+        for f in sorted(task_dir.glob("*.md")):
+            if ".running." in f.name:
+                continue
+            if f.stem == name:
+                body = await request.json()
+                new_content = body.get("content", "").strip()
+                if not new_content:
+                    return JSONResponse({"error": "content 不能为空"}, status_code=400)
+                f.write_text(new_content + "\n", encoding="utf-8")
+                logger.info("编辑任务内容: %s", f.name)
+                return JSONResponse({"updated": f.name})
+        return JSONResponse({"error": f"未找到可编辑的 pending 任务: {name}"}, status_code=404)
+
+    # ── 批量操作 ──────────────────────────────────────────────
+
+    @app.post("/api/tasks/batch/{action}")
+    async def batch_action(action: str) -> JSONResponse:
+        task_dir = workspace / config.task_dir
+        fail_dir = workspace / config.fail_dir
+        done_dir = workspace / config.done_dir
+
+        if action == "retry-all-failed":
+            retried = TaskQueue.retry_failed(task_dir, fail_dir)
+            return JSONResponse({"retried": retried, "count": len(retried)})
+
+        elif action == "clear-done":
+            count = 0
+            if done_dir.is_dir():
+                for f in done_dir.glob("*.md"):
+                    f.unlink()
+                    count += 1
+            logger.info("批量清理已完成任务: %d", count)
+            return JSONResponse({"cleared": count})
+
+        elif action == "recover":
+            count = TaskQueue.recover_running(task_dir)
+            logger.info("批量恢复 running 任务: %d", count)
+            return JSONResponse({"recovered": count})
+
+        return JSONResponse({"error": f"未知操作: {action}"}, status_code=400)
 
     # ── 配置 ─────────────────────────────────────────────────
 
@@ -233,10 +387,19 @@ def create_app(
         ]
 
     @app.post("/api/approvals/{approval_id}/approve")
-    async def approve_plan(approval_id: str) -> JSONResponse:
+    async def approve_plan(approval_id: str, request: Request) -> JSONResponse:
         if approval_store is None:
             return JSONResponse({"error": "approval store not configured"}, status_code=404)
-        if approval_store.approve(approval_id):
+        # 解析可选的 JSON body（feedback / selections）
+        feedback = ""
+        selections: dict = {}
+        try:
+            body = await request.json()
+            feedback = body.get("feedback", "")
+            selections = body.get("selections", {})
+        except Exception:
+            pass  # 无 body 时忽略
+        if approval_store.approve(approval_id, feedback=feedback, selections=selections):
             return JSONResponse({"approved": approval_id})
         return JSONResponse({"error": f"未找到审批: {approval_id}"}, status_code=404)
 
@@ -248,17 +411,40 @@ def create_app(
             return JSONResponse({"rejected": approval_id})
         return JSONResponse({"error": f"未找到审批: {approval_id}"}, status_code=404)
 
-    # ── HTML Dashboard ────────────────────────────────────────
+    # ── 执行历史 ──────────────────────────────────────────────
 
-    @app.get("/", response_class=HTMLResponse)
-    async def dashboard() -> HTMLResponse:
-        html_path = Path(__file__).parent / "dashboard.html"
-        if not html_path.is_file():
-            return HTMLResponse(
-                "<h1>Dashboard not found</h1><p>dashboard.html is missing.</p>",
-                status_code=500,
-            )
-        return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    @app.get("/api/executions")
+    async def list_executions(limit: int = 50) -> list[dict]:
+        if history is None:
+            return []
+        return history.list_recent(limit=limit)
+
+    @app.get("/api/executions/detail/{execution_id}")
+    async def get_execution_detail(execution_id: int) -> JSONResponse:
+        if history is None:
+            return JSONResponse({"error": "history not configured"}, status_code=404)
+        record = history.get_by_id(execution_id)
+        if record is None:
+            return JSONResponse({"error": f"未找到执行记录: {execution_id}"}, status_code=404)
+        return JSONResponse(record)
+
+    @app.get("/api/executions/{task_name}")
+    async def get_task_executions(task_name: str) -> list[dict]:
+        if history is None:
+            return []
+        return history.get_by_task(task_name)
+
+    # ── Worker 状态 ───────────────────────────────────────────
+
+    @app.get("/api/workers")
+    async def list_workers() -> dict:
+        return get_all_worker_status()
+
+    # ── 静态文件服务 (Vue 构建产物) ────────────────────────────
+
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
     return app
 
@@ -274,28 +460,36 @@ def start_server(config: Config, host: str = "0.0.0.0", port: int = 8080) -> Non
     # 创建共享的审批存储
     store = ApprovalStore() if (config.plan_mode and not config.plan_auto_approve) else None
 
+    # 初始化执行历史
+    workspace = Path(config.workspace).resolve()
+    db_path = workspace / config.task_dir / ".vibe_history.db"
+    history = ExecutionHistory(db_path)
+
     # 在主线程注册信号处理器，确保 shutdown_event 被设置
     # （run_loop 在后台线程中无法注册信号处理器）
-    _original_sigint = signal.getsignal(signal.SIGINT)
-
+    # 注意：uvicorn 启动后会覆盖此 handler，但在其 capture_signals
+    # 退出时会 re-raise 信号，此时本 handler 被恢复并调用。
     def _shutdown_handler(signum, frame):
         shutdown_event.set()
-        # 恢复原始处理器，让 uvicorn 正常关闭
-        signal.signal(signum, _original_sigint)
-        if callable(_original_sigint):
-            _original_sigint(signum, frame)
+        # 恢复默认处理器：再次 Ctrl+C 可强制退出
+        signal.signal(signum, signal.SIG_DFL)
 
     signal.signal(signal.SIGINT, _shutdown_handler)
 
     # 后台线程运行任务循环
     loop_thread = threading.Thread(
         target=run_loop, args=(config,),
-        kwargs={"approval_store": store, "continuous": True},
+        kwargs={
+            "approval_store": store,
+            "continuous": True,
+            "on_task_complete": history.record,
+            "history": history,
+        },
         daemon=True, name="vibe-loop",
     )
     loop_thread.start()
     logger.info("任务循环已在后台启动")
 
-    app = create_app(config, approval_store=store)
+    app = create_app(config, approval_store=store, history=history)
     logger.info("Web 管理界面启动: http://%s:%d", host, port)
     uvicorn.run(app, host=host, port=port, log_level="info")

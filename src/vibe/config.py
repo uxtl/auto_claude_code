@@ -33,6 +33,8 @@ class Config:
     docker_extra_args: str = ""
     poll_interval: int = 30
     verbose: bool = False
+    resolve_conflicts: bool = True
+    conflict_timeout: int = 120
 
 
 _ENV_PREFIX = "VIBE_"

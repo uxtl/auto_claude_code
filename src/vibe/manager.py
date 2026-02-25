@@ -28,6 +28,7 @@ class TaskResult:
     tool_results: list[dict] = field(default_factory=list)
     duration_seconds: float = 0.0
     return_code: int | None = None
+    result_text: str = ""
 
 
 def _read_stream(
@@ -55,6 +56,7 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
     files_changed: list[str] = []
     tool_calls: list[dict] = []
     tool_results: list[dict] = []
+    result_text: str = ""
 
     for line in lines:
         line = line.strip()
@@ -91,11 +93,12 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tool_calls.append(block)
 
-        # 提取文件变更
+        # 提取文件变更 + 最终结果文本
         if event_type == "result":
             result_data = event.get("result", "")
             if isinstance(result_data, str):
                 output_parts.append(result_data)
+                result_text = result_data
 
     # 从工具调用中提取文件变更
     for tc in tool_calls:
@@ -113,6 +116,7 @@ def _parse_stream_json(lines: list[str]) -> TaskResult:
         files_changed=files_changed,
         tool_calls=tool_calls,
         tool_results=tool_results,
+        result_text=result_text,
     )
 
 
@@ -379,6 +383,70 @@ def _run_claude(
     result.duration_seconds = duration
     result.return_code = proc.returncode
     return result
+
+
+# ── 冲突解决 ─────────────────────────────────────────────────
+
+CONFLICT_RESOLUTION_PROMPT = """\
+You are resolving git rebase conflicts. The current rebase is paused with conflicts.
+
+Steps:
+1. Run `git status` to see which files have conflicts
+2. For each conflicted file:
+   - Read the file to see the conflict markers (<<<<<<< HEAD, =======, >>>>>>>)
+   - Understand both sides of the conflict
+   - Resolve by keeping the correct combination of changes
+   - Remove ALL conflict markers
+   - `git add <file>`
+3. Run `git rebase --continue`
+4. If more conflicts appear (multi-commit rebase), repeat 1-3
+5. Do NOT run `git rebase --abort`
+"""
+
+
+def resolve_conflicts(
+    cwd: str | Path,
+    timeout: int = 120,
+    *,
+    use_docker: bool = False,
+    docker_image: str = "auto-claude-code",
+    docker_extra_args: str = "",
+    shutdown_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
+) -> TaskResult:
+    """调用 Claude CLI 解决 rebase 冲突.
+
+    Args:
+        cwd: 包含冲突的 worktree 路径
+        timeout: 超时秒数
+        use_docker: 是否在 Docker 容器中执行
+        docker_image: Docker 镜像名
+        docker_extra_args: 额外 docker run 参数
+        shutdown_event: 可选的关闭事件
+        on_output: 可选回调
+
+    Returns:
+        TaskResult，success=True 表示冲突已解决
+    """
+    cwd = Path(cwd).resolve()
+    logger.info("调用 Claude 解决 rebase 冲突, cwd=%s", cwd)
+
+    cmd = [
+        "claude",
+        "-p", CONFLICT_RESOLUTION_PROMPT,
+        "--dangerously-skip-permissions",
+        "--output-format", "stream-json",
+        "--verbose",
+    ]
+
+    return _run_claude(
+        cmd, cwd, timeout,
+        use_docker=use_docker,
+        docker_image=docker_image,
+        docker_extra_args=docker_extra_args,
+        shutdown_event=shutdown_event,
+        on_output=on_output,
+    )
 
 
 # ── 公开 API ────────────────────────────────────────────────

@@ -9,9 +9,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vibe.manager import (
+    CONFLICT_RESOLUTION_PROMPT,
     TaskResult, _build_docker_cmd, _parse_stream_json, _read_stream,
     _run_claude, check_docker_available, ensure_docker_image,
-    execute_plan, generate_plan, run_plan, run_task,
+    execute_plan, generate_plan, resolve_conflicts, run_plan, run_task,
 )
 
 
@@ -583,3 +584,53 @@ class TestShutdownEvent:
             )
 
         assert result.success is True
+
+
+# ── resolve_conflicts ──────────────────────────────────────
+
+class TestResolveConflicts:
+    def test_success(self, tmp_path):
+        """Claude 成功解决冲突 → success=True."""
+        event = {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "conflicts resolved"}]},
+        }
+        stdout_bytes = json.dumps(event).encode() + b"\n"
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.BytesIO(stdout_bytes)
+        mock_proc.stderr = io.BytesIO(b"")
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+
+        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc):
+            result = resolve_conflicts(tmp_path, timeout=60)
+        assert result.success is True
+        assert "conflicts resolved" in result.output
+
+    def test_failure(self, tmp_path):
+        """Claude 解决失败 → success=False."""
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"")
+        mock_proc.stderr = io.BytesIO(b"error\n")
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 1
+
+        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc):
+            result = resolve_conflicts(tmp_path, timeout=60)
+        assert result.success is False
+
+    def test_uses_skip_permissions(self, tmp_path):
+        """命令包含 --dangerously-skip-permissions."""
+        mock_proc = MagicMock()
+        mock_proc.stdout = io.BytesIO(b"")
+        mock_proc.stderr = io.BytesIO(b"")
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+
+        with patch("vibe.manager.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            resolve_conflicts(tmp_path, timeout=60)
+
+        actual_cmd = mock_popen.call_args[0][0]
+        assert "--dangerously-skip-permissions" in actual_cmd
+        assert CONFLICT_RESOLUTION_PROMPT in actual_cmd

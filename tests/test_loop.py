@@ -42,7 +42,7 @@ class TestRunLoop:
         assert mock_wl.call_count == 2
 
     def test_multi_worker_with_worktree(self, workspace: Path):
-        """多 worker + git → 创建/合并/清理 worktree."""
+        """多 worker + git → 创建 worktree + on_task_success/on_before_task 回调 + 无条件清理."""
         cfg = Config(workspace=str(workspace), max_workers=2, use_worktree=True)
         (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
 
@@ -51,14 +51,58 @@ class TestRunLoop:
             patch("vibe.loop.cleanup_stale_worktrees"),
             patch("vibe.loop.create_worktree", side_effect=[Path("/tmp/wt0"), Path("/tmp/wt1")]) as mock_create,
             patch("vibe.loop.worker_loop") as mock_wl,
-            patch("vibe.loop.commit_and_merge") as mock_merge,
+            patch("vibe.loop.MergeCoordinator"),
             patch("vibe.loop.remove_worktree") as mock_remove,
         ):
             run_loop(cfg)
 
         assert mock_create.call_count == 2
         assert mock_wl.call_count == 2
-        assert mock_merge.call_count == 2
+        # 验证 on_task_success 和 on_before_task 回调已传递给 worker_loop
+        for c in mock_wl.call_args_list:
+            assert c.kwargs.get("on_task_success") is not None
+            assert c.kwargs.get("on_before_task") is not None
+        # worktrees 无条件被清理
+        assert mock_remove.call_count == 2
+
+    def test_no_batch_merge_at_end(self, workspace: Path):
+        """验证不再调用旧的 commit_and_merge."""
+        cfg = Config(workspace=str(workspace), max_workers=2, use_worktree=True)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.is_git_repo", return_value=True),
+            patch("vibe.loop.cleanup_stale_worktrees"),
+            patch("vibe.loop.create_worktree", side_effect=[Path("/tmp/wt0"), Path("/tmp/wt1")]),
+            patch("vibe.loop.worker_loop"),
+            patch("vibe.loop.MergeCoordinator"),
+            patch("vibe.loop.remove_worktree"),
+        ):
+            # commit_and_merge 不再被导入/使用，如果代码中仍然引用它会报错
+            run_loop(cfg)
+
+    def test_worktree_always_removed(self, workspace: Path):
+        """即使 worker 抛异常，worktrees 也应被清理."""
+        cfg = Config(workspace=str(workspace), max_workers=2, use_worktree=True)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        def raise_in_worker(*args, **kwargs):
+            raise RuntimeError("worker crashed")
+
+        with (
+            patch("vibe.loop.is_git_repo", return_value=True),
+            patch("vibe.loop.cleanup_stale_worktrees"),
+            patch("vibe.loop.create_worktree", side_effect=[Path("/tmp/wt0"), Path("/tmp/wt1")]),
+            patch("vibe.loop.worker_loop", side_effect=raise_in_worker),
+            patch("vibe.loop.MergeCoordinator"),
+            patch("vibe.loop.remove_worktree") as mock_remove,
+        ):
+            try:
+                run_loop(cfg)
+            except RuntimeError:
+                pass
+
+        # Both worktrees should be cleaned up even after crash
         assert mock_remove.call_count == 2
 
     def test_worktree_creation_failure_fallback(self, workspace: Path):
@@ -84,6 +128,58 @@ class TestRunLoop:
         mock_remove.assert_called_once()
         # 共享模式仍然运行 worker
         assert mock_wl.call_count == 2
+
+
+class TestCoordinatorConfig:
+    def test_coordinator_gets_config(self, workspace: Path):
+        """MergeCoordinator 收到 resolve_conflicts 等配置."""
+        cfg = Config(
+            workspace=str(workspace), max_workers=2, use_worktree=True,
+            resolve_conflicts=True, conflict_timeout=90,
+            use_docker=True, docker_image="my-img", docker_extra_args="--net=none",
+        )
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.is_git_repo", return_value=True),
+            patch("vibe.loop.cleanup_stale_worktrees"),
+            patch("vibe.loop.create_worktree", side_effect=[Path("/tmp/wt0"), Path("/tmp/wt1")]),
+            patch("vibe.loop.worker_loop"),
+            patch("vibe.loop.MergeCoordinator") as mock_mc,
+            patch("vibe.loop.remove_worktree"),
+            patch("vibe.loop.check_docker_available", return_value=(True, "ok")),
+            patch("vibe.loop.ensure_docker_image", return_value=(True, "ok")),
+        ):
+            run_loop(cfg)
+
+        mock_mc.assert_called_once()
+        _, kwargs = mock_mc.call_args
+        assert kwargs["resolve_conflicts"] is True
+        assert kwargs["conflict_timeout"] == 90
+        assert kwargs["use_docker"] is True
+        assert kwargs["docker_image"] == "my-img"
+        assert kwargs["docker_extra_args"] == "--net=none"
+
+    def test_worktree_passes_sync_callback(self, workspace: Path):
+        """on_before_task 被传递给每个 worker."""
+        cfg = Config(workspace=str(workspace), max_workers=2, use_worktree=True)
+        (workspace / "tasks" / "001_test.md").write_text("task", encoding="utf-8")
+
+        with (
+            patch("vibe.loop.is_git_repo", return_value=True),
+            patch("vibe.loop.cleanup_stale_worktrees"),
+            patch("vibe.loop.create_worktree", side_effect=[Path("/tmp/wt0"), Path("/tmp/wt1")]),
+            patch("vibe.loop.worker_loop") as mock_wl,
+            patch("vibe.loop.MergeCoordinator"),
+            patch("vibe.loop.remove_worktree"),
+        ):
+            run_loop(cfg)
+
+        assert mock_wl.call_count == 2
+        for c in mock_wl.call_args_list:
+            cb = c.kwargs.get("on_before_task")
+            assert cb is not None
+            assert callable(cb)
 
 
 class TestDockerPreCheck:
